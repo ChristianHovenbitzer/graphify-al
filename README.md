@@ -1,3 +1,13 @@
+<!--
+  AL FORK of safishamsi/graphify — adds Microsoft Dynamics 365 Business Central (AL)
+  support. See AL_SUPPORT.md for what's added and how to use it. Upstream README follows.
+-->
+
+> **This is an AL/Business Central fork of [graphify](https://github.com/safishamsi/graphify).**
+> It adds `.al` language support (objects, procedures, cross-object calls, event
+> subscriptions, extension targets). See **[AL_SUPPORT.md](AL_SUPPORT.md)**. Everything
+> below is the upstream README.
+
 <p align="center">
   <a href="https://graphifylabs.ai"><img src="https://raw.githubusercontent.com/safishamsi/graphify/v4/docs/logo-text.svg" width="260" height="64" alt="Graphify"/></a>
 </p>

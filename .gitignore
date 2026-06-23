@@ -37,3 +37,11 @@ scripts/llm.py
 scripts/benchmark_kimi*.json
 scripts/benchmark_kimi*.py
 paper/
+
+# --- AL fork: never publish any analyzed codebase or its generated graph ---
+# Analyzed repos + their trees live OUTSIDE this repo (default: ../graphify-trees).
+# These rules are belt-and-suspenders in case anything is created inside the repo.
+trees/
+**/graphify-out/
+**/.graphify-cache/
+*.graph.json

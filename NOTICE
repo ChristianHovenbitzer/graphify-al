@@ -1,0 +1,17 @@
+This project is a fork of Graphify (https://github.com/safishamsi/graphify),
+Copyright (c) 2026 Safi Shamsi, distributed under the MIT License (see LICENSE).
+
+Modifications in this fork add support for the AL programming language
+(Microsoft Dynamics 365 Business Central):
+
+  - graphify/detect.py        — `.al` registered as a code extension
+  - graphify/extract.py       — _AL_CONFIG, extract_al, _al_collect_facts,
+                                _resolve_al_facts (AL semantic layer)
+  - AL_SUPPORT.md, examples/  — fork documentation and a sample
+
+AL modifications Copyright (c) 2026 the fork authors, released under the same
+MIT License as the upstream project.
+
+AL parsing uses tree-sitter-al (https://github.com/SShadowS/tree-sitter-al),
+an independent MIT-licensed grammar, consumed as a normal Python dependency
+(not redistributed in this repository).

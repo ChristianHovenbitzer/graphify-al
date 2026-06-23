@@ -1600,6 +1600,28 @@ def _import_csharp(node, source: bytes, file_nid: str, stem: str, edges: list, s
             break
 
 
+def _import_al(node, source: bytes, file_nid: str, stem: str, edges: list, str_path: str) -> None:
+    # AL `using Microsoft.Sales.Document;` -> imports edge to the full namespace.
+    # Use the whole dotted namespace (not just the last segment) since AL leaf
+    # names like "Document"/"Setup" collide heavily across namespaces.
+    for child in node.children:
+        if child.type == "namespace_name":
+            raw = _read_text(child, source).strip()
+            if raw:
+                tgt_nid = _make_id(raw)
+                edges.append({
+                    "source": file_nid,
+                    "target": tgt_nid,
+                    "relation": "imports",
+                    "context": "import",
+                    "confidence": "EXTRACTED",
+                    "source_file": str_path,
+                    "source_location": f"L{node.start_point[0] + 1}",
+                    "weight": 1.0,
+                })
+            break
+
+
 def _import_kotlin(node, source: bytes, file_nid: str, stem: str, edges: list, str_path: str) -> None:
     path_node = node.child_by_field_name("path")
     if path_node:
@@ -2222,6 +2244,39 @@ _PHP_CONFIG = LanguageConfig(
     body_fallback_child_types=("declaration_list", "compound_statement"),
     function_boundary_types=frozenset({"function_definition", "method_declaration"}),
     import_handler=_import_php,
+)
+
+# AL (Microsoft Dynamics 365 Business Central) — grammar: SShadowS/tree-sitter-al.
+# AL objects (codeunit/table/page/...) map to "classes"; procedures/triggers to
+# "functions". The grammar exposes clean field names (function/object/member on
+# calls, name/body on procedures, object_name/body on objects), so the generic
+# extractor drives it with no custom resolver. Object names live on the
+# `object_name` field (not `name`), so they fall through to the name fallback
+# (`quoted_identifier`/`identifier`); procedures use the `name` field directly.
+_AL_CONFIG = LanguageConfig(
+    ts_module="tree_sitter_al",
+    class_types=frozenset({
+        "codeunit_declaration", "table_declaration", "page_declaration",
+        "report_declaration", "query_declaration", "xmlport_declaration",
+        "enum_declaration", "interface_declaration", "controladdin_declaration",
+        "permissionset_declaration", "permissionsetextension_declaration",
+        "profile_declaration", "profileextension_declaration",
+        "pageextension_declaration", "tableextension_declaration",
+        "reportextension_declaration", "enumextension_declaration",
+        "entitlement_declaration", "dotnet_declaration",
+    }),
+    function_types=frozenset({"procedure", "trigger_declaration", "interface_procedure"}),
+    import_types=frozenset({"using_statement"}),
+    call_types=frozenset({"call_expression"}),
+    call_function_field="function",
+    call_accessor_node_types=frozenset({"member_expression"}),
+    call_accessor_field="member",
+    name_field="name",
+    name_fallback_child_types=("quoted_identifier", "identifier"),
+    body_field="body",
+    body_fallback_child_types=("code_block", "declaration_body", "statement_block"),
+    function_boundary_types=frozenset({"procedure", "trigger_declaration", "interface_procedure"}),
+    import_handler=_import_al,
 )
 
 
@@ -4598,6 +4653,262 @@ def extract_scala(path: Path) -> dict:
 def extract_php(path: Path) -> dict:
     """Extract classes, functions, methods, namespace uses, and calls from a .php file."""
     return _extract_generic(path, _PHP_CONFIG)
+
+
+# ── AL semantic layer ─────────────────────────────────────────────────────────
+# The generic extractor gives objects, procedures and intra-object calls, but AL's
+# real cross-object wiring is invisible to it: calls go through typed variables
+# (`MyCdu.DoThing()`), events bind by attribute, and extensions name a base object.
+# These three facts are collected per file here, then resolved against the global
+# node set in `_resolve_al_facts` (called from extract()).
+#
+# `uses` (Record/Page/Report data dependencies) is high-volume and tends to bury
+# the call graph under a table-sharing hairball, so it is OFF unless
+# GRAPHIFY_AL_USES=1.
+_AL_EMIT_USES = os.environ.get("GRAPHIFY_AL_USES") == "1"
+
+_AL_OBJ_TYPE_RE = re.compile(
+    r'^\s*(?:array\s*\[[^\]]*\]\s*of\s*)?'
+    r'(Codeunit|Record|Page|Report|Query|XmlPort|Enum|Interface|ControlAddIn|TestPage|TestRequestPage)\s+'
+    r'(?:"([^"]+)"|([A-Za-z0-9_]+))',
+    re.IGNORECASE,
+)
+_AL_CODEUNIT_CLASSES = frozenset({"codeunit"})
+_AL_USES_CLASSES = frozenset({"record", "page", "report", "query", "xmlport"})
+
+# EventSubscriber(ObjectType::Codeunit, Codeunit::"Name" | Database::"Name" | 80,
+#                 'OnEvent' | OnEvent, ...)
+_AL_EVENT_RE = re.compile(
+    r'ObjectType::(\w+)\s*,\s*(?:\w+::)?(?:"([^"]+)"|(\d+)|([A-Za-z0-9_]+))\s*,\s*'
+    r"(?:'([^']*)'|([A-Za-z0-9_]+))",
+    re.IGNORECASE,
+)
+
+
+def _al_strip_quotes(s: str) -> str:
+    s = s.strip()
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        return s[1:-1]
+    return s
+
+
+def _al_type_object(type_text: str):
+    """('codeunit', 'LSE Foo') for an object-typed `type_specification`, else None."""
+    m = _AL_OBJ_TYPE_RE.match(type_text)
+    if not m:
+        return None
+    return (m.group(1).lower(), m.group(2) or m.group(3))
+
+
+def _al_parse_event_subscriber(attr_text: str):
+    if "eventsubscriber" not in attr_text.lower():
+        return None
+    m = _AL_EVENT_RE.search(attr_text)
+    if not m:
+        return None
+    objtype, qname, num, ident, ev_q, ev_b = m.groups()
+    name = qname or ident
+    if name:
+        target = name
+    elif num:
+        target = f"{objtype} {num}"  # numeric base-object id, e.g. "Codeunit 80"
+    else:
+        return None
+    return {"target": target, "event": ev_q or ev_b or ""}
+
+
+def _al_collect_facts(tree, source: bytes) -> list[dict]:
+    facts: list[dict] = []
+
+    def text(n) -> str:
+        return source[n.start_byte:n.end_byte].decode("utf-8", "replace")
+
+    def line(n) -> int:
+        return n.start_point[0] + 1
+
+    def collect_vars(container, out: dict) -> None:
+        for c in container.children:
+            if c.type in ("variable_declaration", "parameter"):
+                nm = c.child_by_field_name("name")
+                ty = c.child_by_field_name("type")
+                if nm is not None and ty is not None:
+                    obj = _al_type_object(text(ty))
+                    if obj:
+                        out[text(nm).lower()] = obj
+
+    def walk_calls(node, proc_line: int, varmap: dict) -> None:
+        if node.type == "call_expression":
+            fn = node.child_by_field_name("function")
+            if fn is not None and fn.type == "member_expression":
+                ob = fn.child_by_field_name("object")
+                mem = fn.child_by_field_name("member")
+                if ob is not None and mem is not None and ob.type == "identifier":
+                    hit = varmap.get(text(ob).lower())
+                    if hit and hit[0] in _AL_CODEUNIT_CLASSES:
+                        facts.append({"kind": "calls", "src_line": proc_line,
+                                      "target": hit[1], "method": text(mem)})
+        for c in node.children:
+            walk_calls(c, proc_line, varmap)
+
+    def walk_obj(obj) -> None:
+        obj_line = line(obj)
+        base = obj.child_by_field_name("base_object")
+        if base is not None:
+            facts.append({"kind": "extends", "src_line": obj_line,
+                          "target": _al_strip_quotes(text(base))})
+        body = obj.child_by_field_name("body")
+        if body is None:
+            return
+        obj_vars: dict = {}
+        for c in body.children:
+            if c.type == "var_section":
+                collect_vars(c, obj_vars)
+        uses: set = {v for v in obj_vars.values() if v[0] in _AL_USES_CLASSES}
+
+        pending: list[str] = []
+        for c in body.children:
+            if c.type == "attribute_item":
+                pending.append(text(c))
+                continue
+            if c.type in ("procedure", "trigger_declaration", "interface_procedure"):
+                proc_line = line(c)
+                for a in pending:
+                    ev = _al_parse_event_subscriber(a)
+                    if ev:
+                        facts.append({"kind": "subscribes", "src_line": proc_line, **ev})
+                vm = dict(obj_vars)
+                for pc in c.children:
+                    if pc.type in ("parameter_list", "var_section"):
+                        collect_vars(pc, vm)
+                uses |= {v for v in vm.values() if v[0] in _AL_USES_CLASSES}
+                pbody = c.child_by_field_name("body")
+                if pbody is not None:
+                    walk_calls(pbody, proc_line, vm)
+            pending = []
+
+        if _AL_EMIT_USES:
+            for _cls, name in uses:
+                facts.append({"kind": "uses", "src_line": obj_line, "target": name})
+
+    def find_objs(n) -> None:
+        if n.type in _AL_CONFIG.class_types:
+            walk_obj(n)
+            return
+        for c in n.children:
+            find_objs(c)
+
+    find_objs(tree.root_node)
+    return facts
+
+
+def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
+    """Resolve per-file AL facts to edges against the global node set.
+
+    Object names are globally unique in BC, so name resolution is safe (unlike
+    bare method names). Targets outside the corpus (base-BC objects) get a tagged
+    `external` node so the integration surface is visible rather than dropped.
+    """
+    al_nodes = [n for n in all_nodes
+                if str(n.get("source_file", "")).lower().endswith(".al")]
+    obj_by_name: dict[str, str] = {}
+    objnodes: list[dict] = []
+    for n in al_nodes:
+        lbl = n.get("label", "")
+        if lbl.endswith(".al") or lbl.startswith("."):
+            continue  # file node / procedure node
+        objnodes.append(n)
+        obj_by_name.setdefault(_al_strip_quotes(lbl).lower(), n["id"])
+
+    objids = sorted((n["id"] for n in objnodes), key=len, reverse=True)
+    proc_by_objmeth: dict[tuple, str] = {}
+    for n in al_nodes:
+        lbl = n.get("label", "")
+        if not lbl.startswith("."):
+            continue
+        nid = n["id"]
+        for oid in objids:
+            if nid.startswith(oid + "_"):
+                meth = lbl.strip(".()").lower()
+                proc_by_objmeth.setdefault((oid, meth), nid)
+                break
+
+    new_nodes: list[dict] = []
+    ext_cache: dict[str, str] = {}
+
+    def ensure_external(label: str) -> str:
+        key = label.lower()
+        if key in ext_cache:
+            return ext_cache[key]
+        nid = "al_ext_" + _make_id(label)
+        new_nodes.append({"label": label, "file_type": "external",
+                          "source_file": "", "source_location": "L1",
+                          "_origin": "al_external", "id": nid})
+        ext_cache[key] = nid
+        return nid
+
+    _REL = {"extends": "extends", "subscribes": "subscribes",
+            "calls": "calls", "uses": "references"}
+    new_edges: list[dict] = []
+    seen: set = set()
+    for result in per_file:
+        if not isinstance(result, dict):
+            continue
+        facts = result.get("al_facts")
+        if not facts:
+            continue
+        nodes = result.get("nodes", [])
+        line2nid: dict[int, str] = {}
+        sf = ""
+        for n in nodes:
+            sf = sf or n.get("source_file", "")
+            loc = str(n.get("source_location", ""))
+            if loc[:1] == "L":
+                try:
+                    line2nid.setdefault(int(loc[1:]), n["id"])
+                except ValueError:
+                    pass
+        for f in facts:
+            src = line2nid.get(f.get("src_line"))
+            tname = f.get("target")
+            if not src or not tname:
+                continue
+            tgt = obj_by_name.get(_al_strip_quotes(tname).lower()) or ensure_external(tname)
+            if f["kind"] == "calls":
+                tgt = proc_by_objmeth.get((tgt, str(f.get("method", "")).lower()), tgt)
+            if src == tgt:
+                continue
+            rel = _REL[f["kind"]]
+            pair = (src, tgt, rel)
+            if pair in seen:
+                continue
+            seen.add(pair)
+            new_edges.append({
+                "source": src, "target": tgt, "relation": rel,
+                "context": "al_" + f["kind"],
+                "confidence": "EXTRACTED" if f["kind"] in ("extends", "subscribes") else "INFERRED",
+                "confidence_score": 0.9, "source_file": sf,
+                "source_location": f"L{f.get('src_line', '')}", "weight": 1.0,
+            })
+    all_nodes.extend(new_nodes)
+    return new_edges
+
+
+def extract_al(path: Path) -> dict:
+    """Extract AL objects (codeunit/table/page/...), procedures, triggers, `using`
+    namespace imports, and procedure calls from a .al file (Business Central).
+
+    Also collects AL-specific facts (typed cross-object calls, event subscriptions,
+    extension targets) into result["al_facts"] for cross-file resolution in extract()."""
+    result = _extract_generic(path, _AL_CONFIG)
+    try:
+        import tree_sitter_al as tsal
+        from tree_sitter import Language, Parser
+        parser = Parser(Language(tsal.language()))
+        src = path.read_bytes()
+        result["al_facts"] = _al_collect_facts(parser.parse(src), src)
+    except Exception:
+        result.setdefault("al_facts", [])
+    return result
 
 
 def extract_blade(path: Path) -> dict:
@@ -12454,6 +12765,7 @@ _DISPATCH: dict[str, Any] = {
     ".cshtml": extract_razor,
     ".cls": extract_apex,
     ".trigger": extract_apex,
+    ".al": extract_al,
 }
 
 
@@ -12842,6 +13154,15 @@ def extract(
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning("Java type-reference resolution failed, skipping: %s", exc)
+
+    # Cross-file AL resolution: typed Codeunit calls, event subscriptions, and
+    # extension targets — the cross-object wiring the generic extractor can't see.
+    if any(p.suffix == ".al" for p in paths):
+        try:
+            all_edges.extend(_resolve_al_facts(per_file, all_nodes))
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("AL resolution failed, skipping: %s", exc)
 
     # Cross-file call resolution for all languages
     # Each extractor saved unresolved calls in raw_calls. Now that we have all
