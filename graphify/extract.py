@@ -4728,6 +4728,13 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
 
     def collect_vars(container, out: dict) -> None:
         for c in container.children:
+            if c.type == "var_body":
+                # tree-sitter-al nests declarations one level deeper for a
+                # `var` section: var_section -> var_body -> variable_declaration.
+                # Without this, every var-declared field/local (the dominant
+                # AL "impl codeunit" pattern) is silently invisible here.
+                collect_vars(c, out)
+                continue
             if c.type in ("variable_declaration", "parameter"):
                 nm = c.child_by_field_name("name")
                 ty = c.child_by_field_name("type")
