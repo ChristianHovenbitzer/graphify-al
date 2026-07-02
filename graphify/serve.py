@@ -7,9 +7,10 @@ import sys
 from pathlib import Path
 import networkx as nx
 from networkx.readwrite import json_graph
-from graphify.security import sanitize_label, check_graph_file_size_cap
+from graphify.security import sanitize_label, check_graph_file_size_cap, validate_graph_path
 from graphify.build import edge_data
 from graphify.paths import default_graph_json as _default_graph_json
+from graphify import source_lookup
 
 try:
     import jieba as _jieba  # type: ignore[import-untyped]
@@ -614,7 +615,7 @@ def _filter_blank_stdin() -> None:
     sys.stdin = open(0, "r", closefd=False)
 
 
-def _build_server(graph_path: str, *, instructions: str | None = None):
+def _build_server(graph_path: str, *, instructions: str | None = None, source_root: str | None = None):
     """Build the configured low-level MCP Server (shared by every transport).
 
     All graph query tools and resources are registered here over a single
@@ -627,8 +628,16 @@ def _build_server(graph_path: str, *, instructions: str | None = None):
     specific codebase) should pass their own description via this parameter
     (or ``--instructions``/``GRAPHIFY_INSTRUCTIONS`` on the CLI) so an agent
     with zero prior context knows what graph it's actually looking at.
+
+    ``source_root`` anchors get_signature/get_procedure_body/get_object_source,
+    which re-read the on-disk source a node points at (the graph itself only
+    stores file+line, not text). Defaults to ``graph_path``'s grandparent
+    (``<source_root>/<GRAPHIFY_OUT>/graph.json``), which matches every
+    existing deployment layout without needing an extra flag.
     """
     import threading
+
+    _source_root = Path(source_root).resolve() if source_root else Path(graph_path).resolve().parent.parent
 
     try:
         from mcp.server import Server
@@ -741,6 +750,52 @@ def _build_server(graph_path: str, *, instructions: str | None = None):
                         "label": {"type": "string"},
                         "relation_filter": {"type": "string", "description": "Optional: filter by relation type"},
                     },
+                    "required": ["label"],
+                },
+            ),
+            types.Tool(
+                name="get_signature",
+                description=(
+                    "Lightweight ground-truth check: the exact declaration"
+                    " header (object header, or procedure/trigger signature"
+                    " with its return type) for a node, re-read from the real"
+                    " source file -- no body. Use this to confirm a"
+                    " search/graph hit is the right one before pulling the"
+                    " full body."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {"label": {"type": "string", "description": "Node label or ID to look up"}},
+                    "required": ["label"],
+                },
+            ),
+            types.Tool(
+                name="get_procedure_body",
+                description=(
+                    "Exact, full source text of one procedure/trigger, re-read"
+                    " from the real source file (not the index) -- signature,"
+                    " var declarations, and every line of the body. Errors if"
+                    " the node isn't inside a procedure/trigger; use"
+                    " get_object_source for object-level nodes."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {"label": {"type": "string", "description": "Node label or ID to look up"}},
+                    "required": ["label"],
+                },
+            ),
+            types.Tool(
+                name="get_object_source",
+                description=(
+                    "Exact, full source text of the object (table/page/"
+                    "codeunit/...) that a node belongs to, re-read from the"
+                    " real source file. Pass either the object's own node or"
+                    " any procedure inside it -- both resolve to the same"
+                    " object source."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {"label": {"type": "string", "description": "Node label or ID to look up"}},
                     "required": ["label"],
                 },
             ),
@@ -982,6 +1037,35 @@ def _build_server(graph_path: str, *, instructions: str | None = None):
             )
         return "\n".join(lines)
 
+    def _tool_source_lookup(label: str, fn) -> str:
+        matches = _find_node(G, label.lower())
+        if not matches:
+            return f"No node matching '{label}' found."
+        nid = matches[0]
+        d = G.nodes[nid]
+        source_file = d.get("source_file") or ""
+        if not source_file:
+            return f"Node '{sanitize_label(d.get('label', nid))}' has no associated source file."
+        try:
+            source_path = validate_graph_path(_source_root / source_file, base=_source_root)
+        except FileNotFoundError:
+            return f"Source file not found on disk: {source_file}"
+        except ValueError:
+            return f"Source path escapes the indexed source root: {source_file}"
+        try:
+            return fn(source_path, d.get("source_location"))
+        except source_lookup.SourceLookupError as exc:
+            return str(exc)
+
+    def _tool_get_signature(arguments: dict) -> str:
+        return _tool_source_lookup(arguments["label"], source_lookup.get_signature)
+
+    def _tool_get_procedure_body(arguments: dict) -> str:
+        return _tool_source_lookup(arguments["label"], source_lookup.get_procedure_body)
+
+    def _tool_get_object_source(arguments: dict) -> str:
+        return _tool_source_lookup(arguments["label"], source_lookup.get_object_source)
+
     def _tool_get_community(arguments: dict) -> str:
         cid = int(arguments["community_id"])
         nodes = communities.get(cid, [])
@@ -1161,6 +1245,9 @@ def _build_server(graph_path: str, *, instructions: str | None = None):
         "get_node": _tool_get_node,
         "resolve_node": _tool_resolve_node,
         "get_neighbors": _tool_get_neighbors,
+        "get_signature": _tool_get_signature,
+        "get_procedure_body": _tool_get_procedure_body,
+        "get_object_source": _tool_get_object_source,
         "get_community": _tool_get_community,
         "god_nodes": _tool_god_nodes,
         "graph_stats": _tool_graph_stats,
@@ -1256,7 +1343,7 @@ def _build_server(graph_path: str, *, instructions: str | None = None):
     return server
 
 
-def serve(graph_path: str | None = None, *, instructions: str | None = None) -> None:
+def serve(graph_path: str | None = None, *, instructions: str | None = None, source_root: str | None = None) -> None:
     """Start the MCP server over stdio (the default, per-developer transport)."""
     graph_path = graph_path or _default_graph_json()
     try:
@@ -1265,7 +1352,7 @@ def serve(graph_path: str | None = None, *, instructions: str | None = None) -> 
         raise ImportError('mcp not installed. Run: pip install "graphifyy[mcp]"') from e
     import asyncio
 
-    server = _build_server(graph_path, instructions=instructions)
+    server = _build_server(graph_path, instructions=instructions, source_root=source_root)
 
     async def main() -> None:
         async with stdio_server() as streams:
@@ -1343,6 +1430,7 @@ def _build_http_app(
     stateless: bool = False,
     session_timeout: float | None = 3600.0,
     instructions: str | None = None,
+    source_root: str | None = None,
 ):
     """Build the Starlette ASGI app for the Streamable HTTP transport.
 
@@ -1373,7 +1461,7 @@ def _build_http_app(
     # mistaken for "auth on" — normalize it to None so the gate is unambiguous.
     api_key = (api_key or "").strip() or None
 
-    server = _build_server(graph_path, instructions=instructions)
+    server = _build_server(graph_path, instructions=instructions, source_root=source_root)
 
     # DNS-rebinding protection. When the operator binds a wildcard address they
     # are intentionally exposing the server, so accept any Host header; for a
@@ -1426,6 +1514,7 @@ def serve_http(
     stateless: bool = False,
     session_timeout: float | None = 3600.0,
     instructions: str | None = None,
+    source_root: str | None = None,
 ) -> None:
     """Start the MCP server over Streamable HTTP (MCP spec 2025-03-26).
 
@@ -1459,6 +1548,7 @@ def serve_http(
         stateless=stateless,
         session_timeout=session_timeout,
         instructions=instructions,
+        source_root=source_root,
     )
 
     auth_note = "api-key required" if api_key else "no auth (set --api-key to require one)"
@@ -1537,6 +1627,17 @@ def _main(argv: list[str] | None = None) -> None:
             "looking at."
         ),
     )
+    parser.add_argument(
+        "--source-root",
+        default=os.environ.get("GRAPHIFY_SOURCE_ROOT"),
+        help=(
+            "Root directory that source_file paths in graph.json are relative"
+            " to (env: GRAPHIFY_SOURCE_ROOT). Used by get_signature/"
+            " get_procedure_body/get_object_source to re-read exact source."
+            " Defaults to graph_path's grandparent directory, which matches"
+            " every existing deployment layout."
+        ),
+    )
     args = parser.parse_args(argv)
     graph_path = args.graph_flag or args.graph_path or _default_graph_json()
 
@@ -1551,9 +1652,10 @@ def _main(argv: list[str] | None = None) -> None:
             stateless=args.stateless,
             session_timeout=args.session_timeout,
             instructions=args.instructions,
+            source_root=args.source_root,
         )
     else:
-        serve(graph_path, instructions=args.instructions)
+        serve(graph_path, instructions=args.instructions, source_root=args.source_root)
 
 
 if __name__ == "__main__":
