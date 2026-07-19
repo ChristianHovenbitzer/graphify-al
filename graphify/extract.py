@@ -4675,6 +4675,12 @@ _AL_OBJ_TYPE_RE = re.compile(
 )
 _AL_CODEUNIT_CLASSES = frozenset({"codeunit"})
 _AL_USES_CLASSES = frozenset({"record", "page", "report", "query", "xmlport"})
+_AL_PROC_TYPES = frozenset({"procedure", "trigger_declaration", "interface_procedure"})
+
+# Built-in indirect dispatch: Codeunit.Run(Codeunit::"X"), Page.RunModal(Page::"Y"),
+# Report.Run(Report::"Z"). The object keyword parses as a `keyword_identifier`.
+_AL_RUN_KEYWORDS = frozenset({"codeunit", "page", "report"})
+_AL_RUN_METHODS = frozenset({"run", "runmodal"})
 
 # EventSubscriber(ObjectType::Codeunit, Codeunit::"Name" | Database::"Name" | 80,
 #                 'OnEvent' | OnEvent, ...)
@@ -4727,6 +4733,9 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
         return n.start_point[0] + 1
 
     def collect_vars(container, out: dict) -> None:
+        # A var_section wraps its declarations in a var_body, so the declarations
+        # are grandchildren, not children. Recurse, but never cross into a nested
+        # procedure — its locals belong to that procedure's scope, not this one.
         for c in container.children:
             if c.type in ("variable_declaration", "parameter"):
                 nm = c.child_by_field_name("name")
@@ -4735,6 +4744,25 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                     obj = _al_type_object(text(ty))
                     if obj:
                         out[text(nm).lower()] = obj
+            elif c.type not in _AL_PROC_TYPES:
+                collect_vars(c, out)
+
+    def run_dispatch_target(call_node, objclass: str):
+        # First argument of Codeunit.Run/Page.RunModal/Report.Run names the target:
+        # an object reference (Codeunit::"X") or a bare numeric base-object id.
+        args = call_node.child_by_field_name("arguments")
+        if args is None:
+            return None
+        for a in args.children:
+            if not a.is_named:
+                continue
+            if a.type == "database_reference":
+                tn = a.child_by_field_name("table_name")
+                return _al_strip_quotes(text(tn)) if tn is not None else None
+            if a.type == "integer":
+                return f"{objclass} {text(a)}"  # numeric base-object id
+            return None  # first real arg is not an object -> can't resolve statically
+        return None
 
     def walk_calls(node, proc_line: int, varmap: dict) -> None:
         if node.type == "call_expression":
@@ -4742,20 +4770,84 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
             if fn is not None and fn.type == "member_expression":
                 ob = fn.child_by_field_name("object")
                 mem = fn.child_by_field_name("member")
-                if ob is not None and mem is not None and ob.type == "identifier":
-                    hit = varmap.get(text(ob).lower())
-                    if hit and hit[0] in _AL_CODEUNIT_CLASSES:
-                        facts.append({"kind": "calls", "src_line": proc_line,
-                                      "target": hit[1], "method": text(mem)})
+                if ob is not None and mem is not None:
+                    if ob.type == "identifier":
+                        hit = varmap.get(text(ob).lower())
+                        if hit and hit[0] in _AL_CODEUNIT_CLASSES:
+                            facts.append({"kind": "calls", "src_line": proc_line,
+                                          "target": hit[1], "method": text(mem),
+                                          "target_kind": "codeunit"})
+                        elif hit and hit[0] == "interface":
+                            # Interface dispatch: MyVar.Method() where MyVar is
+                            # `Interface "IFoo"`. The concrete target is unknown
+                            # statically, so resolution fans the call out to every
+                            # object that `implements "IFoo"`.
+                            facts.append({"kind": "iface_calls", "src_line": proc_line,
+                                          "target": hit[1], "method": text(mem),
+                                          "target_kind": "interface"})
+                    elif (ob.type == "keyword_identifier"
+                          and text(ob).lower() in _AL_RUN_KEYWORDS
+                          and text(mem).lower() in _AL_RUN_METHODS):
+                        tgt = run_dispatch_target(node, text(ob))
+                        if tgt:
+                            facts.append({"kind": "calls", "src_line": proc_line,
+                                          "target": tgt, "method": text(mem),
+                                          "target_kind": text(ob).lower()})
         for c in node.children:
             walk_calls(c, proc_line, varmap)
 
     def walk_obj(obj) -> None:
         obj_line = line(obj)
+        # AL object names are unique only *within* an object type (a page and its
+        # source table routinely share a name), so record this object's class to let
+        # cross-object resolution disambiguate same-named targets by kind.
+        objclass = obj.type[:-12] if obj.type.endswith("_declaration") else obj.type
+        facts.append({"kind": "objclass", "src_line": obj_line, "objclass": objclass})
         base = obj.child_by_field_name("base_object")
         if base is not None:
             facts.append({"kind": "extends", "src_line": obj_line,
                           "target": _al_strip_quotes(text(base))})
+
+        def walk_refs(n) -> None:
+            # Structural cross-object references, all anchored to the object node
+            # (their AST lines don't map to graph nodes; the enclosing object does).
+            t = n.type
+            if t == "implements_clause":
+                for ic in n.children:
+                    if ic.type in ("quoted_identifier", "identifier"):
+                        facts.append({"kind": "implements", "src_line": obj_line,
+                                      "target": _al_strip_quotes(text(ic)),
+                                      "target_kind": "interface"})
+            elif t == "property":
+                pn = n.child_by_field_name("name")
+                if pn is not None and text(pn).lower() == "sourcetable":
+                    pv = n.child_by_field_name("value")
+                    if pv is not None:
+                        facts.append({"kind": "source_table", "src_line": obj_line,
+                                      "target": _al_strip_quotes(text(pv)),
+                                      "target_kind": "table"})
+            elif t in ("report_dataitem", "query_dataitem"):
+                tn = n.child_by_field_name("table_name")
+                if tn is not None:
+                    facts.append({"kind": "source_table", "src_line": obj_line,
+                                  "target": _al_strip_quotes(text(tn)),
+                                  "target_kind": "table"})
+            elif t == "simple_table_relation":
+                tbl = n.child_by_field_name("table")  # first `table:` is the table
+                if tbl is not None:
+                    facts.append({"kind": "tablerel", "src_line": obj_line,
+                                  "target": _al_strip_quotes(text(tbl)),
+                                  "target_kind": "table"})
+            elif t == "type_specification":
+                o = _al_type_object(text(n))
+                if o and o[0] == "enum":
+                    facts.append({"kind": "enum_ref", "src_line": obj_line,
+                                  "target": o[1], "target_kind": "enum"})
+            for c in n.children:
+                walk_refs(c)
+
+        walk_refs(obj)
+
         body = obj.child_by_field_name("body")
         if body is None:
             return
@@ -4770,7 +4862,7 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
             if c.type == "attribute_item":
                 pending.append(text(c))
                 continue
-            if c.type in ("procedure", "trigger_declaration", "interface_procedure"):
+            if c.type in _AL_PROC_TYPES:
                 proc_line = line(c)
                 for a in pending:
                     ev = _al_parse_event_subscriber(a)
@@ -4804,9 +4896,11 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
 def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
     """Resolve per-file AL facts to edges against the global node set.
 
-    Object names are globally unique in BC, so name resolution is safe (unlike
-    bare method names). Targets outside the corpus (base-BC objects) get a tagged
-    `external` node so the integration surface is visible rather than dropped.
+    AL object names are unique only within an object type, so targets that carry a
+    known kind (source_table->table, implements->interface, ...) resolve against a
+    (class, name) index; kind-less facts fall back to name alone. Targets outside the
+    corpus (base-BC objects) get a tagged `external` node so the integration surface
+    is visible rather than dropped.
     """
     al_nodes = [n for n in all_nodes
                 if str(n.get("source_file", "")).lower().endswith(".al")]
@@ -4846,20 +4940,21 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
         ext_cache[key] = nid
         return nid
 
-    _REL = {"extends": "extends", "subscribes": "subscribes",
-            "calls": "calls", "uses": "references"}
-    new_edges: list[dict] = []
-    seen: set = set()
+    # Pre-pass: resolve each file's line->node map once, and learn every AL object
+    # node's class (page/table/codeunit/...) from its `objclass` fact. AL names are
+    # unique only within a class, so class is what disambiguates same-named targets
+    # (a page and its source table routinely share a name).
+    prepared: list[tuple] = []
+    node_class: dict[str, str] = {}
     for result in per_file:
         if not isinstance(result, dict):
             continue
         facts = result.get("al_facts")
         if not facts:
             continue
-        nodes = result.get("nodes", [])
         line2nid: dict[int, str] = {}
         sf = ""
-        for n in nodes:
+        for n in result.get("nodes", []):
             sf = sf or n.get("source_file", "")
             loc = str(n.get("source_location", ""))
             if loc[:1] == "L":
@@ -4868,27 +4963,95 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
                 except ValueError:
                     pass
         for f in facts:
+            if f.get("kind") == "objclass":
+                nid = line2nid.get(f.get("src_line"))
+                if nid:
+                    node_class[nid] = f.get("objclass", "")
+        prepared.append((facts, line2nid, sf))
+
+    obj_by_classname: dict[tuple, str] = {}
+    for n in objnodes:
+        cls = node_class.get(n["id"])
+        if cls:
+            obj_by_classname.setdefault(
+                (cls, _al_strip_quotes(n.get("label", "")).lower()), n["id"])
+
+    def resolve_target(tname: str, tkind: str) -> str:
+        key = _al_strip_quotes(tname).lower()
+        if tkind:
+            nid = obj_by_classname.get((tkind, key))
+            if nid is not None:
+                return nid
+            # A same-named node of a *different* class is the wrong object; the real
+            # target is outside the corpus (base BC) -> external, not a false edge.
+            return ensure_external(tname)
+        return obj_by_name.get(key) or ensure_external(tname)
+
+    # Interface dispatch fans out to implementors: index every object that
+    # `implements "IFoo"` by the interface's resolved node id, so a call on an
+    # `IFoo`-typed variable can enumerate the concrete methods it might reach.
+    # Keying by node id (not name) makes corpus and external interfaces line up:
+    # both the implements fact and the call resolve to the same interface node.
+    implementors_by_iface: dict[str, list[str]] = {}
+    for facts, line2nid, _sf in prepared:
+        for f in facts:
+            if f.get("kind") != "implements":
+                continue
             src = line2nid.get(f.get("src_line"))
             tname = f.get("target")
             if not src or not tname:
                 continue
-            tgt = obj_by_name.get(_al_strip_quotes(tname).lower()) or ensure_external(tname)
-            if f["kind"] == "calls":
+            implementors_by_iface.setdefault(
+                resolve_target(tname, "interface"), []).append(src)
+
+    _REL = {"extends": "extends", "subscribes": "subscribes",
+            "calls": "calls", "uses": "references",
+            "source_table": "references", "tablerel": "references",
+            "enum_ref": "references", "implements": "implements"}
+    _EXTRACTED_KINDS = frozenset({
+        "extends", "subscribes", "source_table", "tablerel",
+        "enum_ref", "implements"})
+    new_edges: list[dict] = []
+    seen: set = set()
+
+    def add_edge(src: str, tgt: str, rel: str, kind: str, sf: str, src_line) -> None:
+        if not src or not tgt or src == tgt:
+            return
+        pair = (src, tgt, rel)
+        if pair in seen:
+            return
+        seen.add(pair)
+        new_edges.append({
+            "source": src, "target": tgt, "relation": rel,
+            "context": "al_" + kind,
+            "confidence": "EXTRACTED" if kind in _EXTRACTED_KINDS else "INFERRED",
+            "confidence_score": 0.9, "source_file": sf,
+            "source_location": f"L{src_line}", "weight": 1.0,
+        })
+
+    for facts, line2nid, sf in prepared:
+        for f in facts:
+            kind = f.get("kind")
+            if kind == "objclass":
+                continue  # metadata fact, not an edge
+            src = line2nid.get(f.get("src_line"))
+            tname = f.get("target")
+            if not src or not tname:
+                continue
+            sl = f.get("src_line", "")
+            if kind == "iface_calls":
+                # Fan out to each object that implements the interface, landing on
+                # the concrete method when it exists (else the implementor object).
+                iface = resolve_target(tname, "interface")
+                meth = str(f.get("method", "")).lower()
+                for impl in implementors_by_iface.get(iface, ()):
+                    tgt = proc_by_objmeth.get((impl, meth), impl)
+                    add_edge(src, tgt, "calls", "iface_calls", sf, sl)
+                continue
+            tgt = resolve_target(tname, f.get("target_kind", ""))
+            if kind == "calls":
                 tgt = proc_by_objmeth.get((tgt, str(f.get("method", "")).lower()), tgt)
-            if src == tgt:
-                continue
-            rel = _REL[f["kind"]]
-            pair = (src, tgt, rel)
-            if pair in seen:
-                continue
-            seen.add(pair)
-            new_edges.append({
-                "source": src, "target": tgt, "relation": rel,
-                "context": "al_" + f["kind"],
-                "confidence": "EXTRACTED" if f["kind"] in ("extends", "subscribes") else "INFERRED",
-                "confidence_score": 0.9, "source_file": sf,
-                "source_location": f"L{f.get('src_line', '')}", "weight": 1.0,
-            })
+            add_edge(src, tgt, _REL[kind], kind, sf, sl)
     all_nodes.extend(new_nodes)
     return new_edges
 

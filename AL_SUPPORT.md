@@ -43,16 +43,28 @@ are `.ProcName()`. `examples/` has a tiny synthetic app you can build and query 
 | Relation | Meaning |
 |---|---|
 | `contains` / `method` | file → object (codeunit, table, page, report, query, xmlport, enum, interface, extensions) → its procedures/triggers |
-| `calls` | intra-object procedure calls, **plus** type-resolved cross-object Codeunit calls (`MyCdu.DoThing()` resolved via the variable's declared type) |
+| `calls` | intra-object procedure calls, type-resolved cross-object Codeunit calls (`MyCdu.DoThing()` resolved via the variable's declared type), indirect dispatch `Codeunit.Run` / `Page.Run(Modal)` / `Report.Run(...)` resolved via the `Object::"Name"` argument, **plus** interface dispatch (`IFoo.Method()` on an `Interface "IFoo"`-typed variable) fanned out to `Method` on every object that `implements "IFoo"` |
 | `subscribes` | `[EventSubscriber]` → the publisher object named in the attribute (objects outside the analyzed corpus become tagged `external` nodes — the integration surface) |
 | `extends` | `tableextension` / `pageextension` / etc. → its base object |
+| `implements` | object → each interface in its `implements` clause |
+| `references` | page `SourceTable`, report/query `dataitem` → table; field `TableRelation` → table; `Enum "X"`-typed field/variable → enum |
 | `imports` | `using` namespace directives |
+
+Because AL names are unique only *within* an object type (a page and its source
+table routinely share a name), cross-object targets are resolved against a
+`(object class, name)` index — so a page's `SourceTable` edge lands on the table,
+not on the same-named page.
 
 ## Honest limitations
 
-- **Cross-object call resolution is partial.** Only direct, statically-typed calls resolve.
-  Event-driven flow, interface dispatch, and service-locator patterns can't be followed
-  statically — use the `subscribes` edges to see event wiring.
+- **Cross-object call resolution is partial.** Statically-typed calls, the
+  `Codeunit.Run` / `Page.RunModal` / `Report.Run` dispatch idioms, and interface
+  dispatch all resolve. Interface dispatch is a *fan-out*: a call on an
+  `Interface "IFoo"`-typed variable produces a `calls` edge to that method on every
+  object implementing `IFoo` (the static analysis can't know which concrete
+  implementation runs, so it links all candidates — an over- rather than
+  under-approximation). Service-locator / reflection patterns still can't be
+  followed statically; use the `subscribes` edges to see event wiring.
 - **The static `GRAPH_REPORT.md` god-nodes / "surprising connections" sections are object-only.**
   graphify's report treats `.foo()` labels as synthetic stubs (a Python/JS assumption), which
   excludes AL procedures *from that report section only*. The `query`/`affected`/`path` engine
