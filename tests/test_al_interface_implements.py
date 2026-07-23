@@ -58,8 +58,9 @@ def test_al_implements_and_enum_bound_implementation_edges(tmp_path: Path):
 
     # 1. codeunit ... implements IFoo
     assert ("PayCard", "implements", "IPay") in impl_edges
-    # 2a. enum binds the concrete impl codeunit
-    assert ("PayMethod", "enum_binds_implementation", "PayPalImpl") in bind_edges
+    # 2a. enum binds the concrete impl codeunit — anchored on the enum VALUE node
+    # (".PayPal"), not the enum object.
+    assert (".PayPal", "enum_binds_implementation", "PayPalImpl") in bind_edges
     # 2b. the enum-bound impl implements the interface
     assert ("PayPalImpl", "implements", "IPay") in impl_edges
     # 2c. the enum's own implements clause

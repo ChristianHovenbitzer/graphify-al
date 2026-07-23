@@ -5107,7 +5107,8 @@ _AL_IMPL_PAIR_RE = re.compile(
 
 
 def _al_parse_implementation(prop_text: str):
-    """[(interface, impl), ...] from an enum value `Implementation` property text."""
+    """[(interface, impl), ...] from an enum `Implementation` /
+    `DefaultImplementation` / `UnknownValueImplementation` property text."""
     rhs = prop_text.split("=", 1)
     if len(rhs) < 2:
         return []
@@ -5118,6 +5119,18 @@ def _al_parse_implementation(prop_text: str):
         if iface and impl:
             pairs.append((iface, impl))
     return pairs
+
+
+# profile `RoleCenter = "<page>"` — the profile's home RoleCenter page.
+_AL_ROLECENTER_RE = re.compile(
+    r'RoleCenter\s*=\s*("[^"]+"|[A-Za-z0-9_]+)', re.IGNORECASE
+)
+
+
+def _al_parse_rolecenter(prop_text: str):
+    """The RoleCenter page name from a profile `RoleCenter` property text, else None."""
+    m = _AL_ROLECENTER_RE.search(prop_text)
+    return _al_strip_quotes(m.group(1)) if m else None
 
 
 def _al_parse_event_subscriber(attr_text: str):
@@ -5563,8 +5576,36 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
         collect_bindings(body, obj_line)
         if obj.type in ("page_declaration", "pageextension_declaration"):
             collect_page_actions(body, _al_page_source_table(body))
+        # profile `RoleCenter = "<page>"`: link the profile to its home page.
+        if obj.type in ("profile_declaration", "profileextension_declaration"):
+            for prop in body.children:
+                if prop.type != "property":
+                    continue
+                page = _al_parse_rolecenter(text(prop))
+                if page:
+                    facts.append({"kind": "rolecenter", "src_line": obj_line,
+                                  "target": page})
+        # Object-level enum `DefaultImplementation` / `UnknownValueImplementation`:
+        # the enum object binds the concrete impl (enum_binds_implementation) and
+        # that impl implements the interface. Anchored on the enum OBJECT (these are
+        # object-level properties), unlike the value-level `Implementation` below.
+        if obj.type in ("enum_declaration", "enumextension_declaration"):
+            for prop in body.children:
+                if prop.type != "property":
+                    continue
+                ptext = text(prop)
+                if not re.match(r"\s*(Default|UnknownValue)Implementation\b",
+                                ptext, re.IGNORECASE):
+                    continue
+                for iface, impl in _al_parse_implementation(ptext):
+                    facts.append({"kind": "enum_binds_implementation",
+                                  "src_line": obj_line, "target": impl})
+                    facts.append({"kind": "implements",
+                                  "src_name": impl, "target": iface})
         # enum value `Implementation = IFace = Impl` bindings: the enum binds the
         # concrete impl (enum_binds_implementation) and that impl implements IFace.
+        # Anchored on the enum VALUE node (its own declaration line), not the enum
+        # object, so the binding attaches to the value it belongs to.
         for c in body.children:
             if c.type != "enum_value_declaration":
                 continue
@@ -5584,7 +5625,7 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                     continue
                 for iface, impl in _al_parse_implementation(ptext):
                     facts.append({"kind": "enum_binds_implementation",
-                                  "src_line": obj_line, "target": impl})
+                                  "src_line": line(c), "target": impl})
                     facts.append({"kind": "implements",
                                   "src_name": impl, "target": iface})
         obj_vars: dict = {}
@@ -6069,7 +6110,7 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
         "relates_to": "table", "computes_from": "table", "transfers_to": "table",
         "binds": "table", "implements": "interface",
         "enum_binds_implementation": "codeunit", "typed_as": "enum",
-        "sub_page": "page",
+        "sub_page": "page", "rolecenter": "page",
     }
 
     # A permissionset grant's object kind maps to the target object's node type,
@@ -6088,11 +6129,12 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
             "enum_binds_implementation": "enum_binds_implementation",
             "transfers_to": "transfers_to", "typed_as": "typed_as",
             "grants": "grants", "sub_page": "subpage",
-            "navigates_to": "navigates_to"}
+            "navigates_to": "navigates_to", "rolecenter": "rolecenter"}
     _EXTRACTED = frozenset({"extends", "subscribes", "binds", "relates_to",
                             "computes_from", "implements",
                             "enum_binds_implementation", "transfers_to",
-                            "typed_as", "grants", "sub_page", "navigates_to"})
+                            "typed_as", "grants", "sub_page", "navigates_to",
+                            "rolecenter"})
 
     # Interface dispatch fans a call on an `Interface "IFoo"`-typed variable out to
     # every object that `implements "IFoo"`. Pre-index implementor node ids by
