@@ -2253,6 +2253,8 @@ _PHP_CONFIG = LanguageConfig(
 # extractor drives it with no custom resolver. Object names live on the
 # `object_name` field (not `name`), so they fall through to the name fallback
 # (`quoted_identifier`/`identifier`); procedures use the `name` field directly.
+# A controladdin's `event(...)` declarations (the JS->AL contract) are treated as
+# functions too, so each becomes a `.OnFoo()` node parented to the add-in (#41).
 _AL_CONFIG = LanguageConfig(
     ts_module="tree_sitter_al",
     class_types=frozenset({
@@ -2265,7 +2267,7 @@ _AL_CONFIG = LanguageConfig(
         "reportextension_declaration", "enumextension_declaration",
         "entitlement_declaration", "dotnet_declaration",
     }),
-    function_types=frozenset({"procedure", "trigger_declaration", "interface_procedure"}),
+    function_types=frozenset({"procedure", "trigger_declaration", "interface_procedure", "event_declaration"}),
     import_types=frozenset({"using_statement"}),
     call_types=frozenset({"call_expression"}),
     call_function_field="function",
@@ -2275,7 +2277,7 @@ _AL_CONFIG = LanguageConfig(
     name_fallback_child_types=("quoted_identifier", "identifier"),
     body_field="body",
     body_fallback_child_types=("code_block", "declaration_body", "statement_block"),
-    function_boundary_types=frozenset({"procedure", "trigger_declaration", "interface_procedure"}),
+    function_boundary_types=frozenset({"procedure", "trigger_declaration", "interface_procedure", "event_declaration"}),
     import_handler=_import_al,
 )
 
@@ -5203,14 +5205,30 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
             return None  # first real arg is not an object -> can't resolve statically
         return None
 
-    def walk_calls(node, proc_line: int, varmap: dict) -> None:
+    def walk_calls(node, proc_line: int, varmap: dict, usercontrols: dict) -> None:
         if node.type == "call_expression":
             fn = node.child_by_field_name("function")
             if fn is not None and fn.type == "member_expression":
                 ob = fn.child_by_field_name("object")
                 mem = fn.child_by_field_name("member")
                 if ob is not None and mem is not None:
-                    if ob.type == "identifier":
+                    if ob.type == "member_expression" and usercontrols:
+                        # `CurrPage.<ctrl>.<proc>()` — a call into a page control
+                        # add-in's procedure. The outer object is itself a
+                        # member_expression (CurrPage.<ctrl>); resolve <ctrl> to its
+                        # add-in via the page's `usercontrol` map so the call lands
+                        # on the add-in's procedure (works cross-file, unlike the
+                        # generic bare-method resolver) (#41).
+                        inner_ob = ob.child_by_field_name("object")
+                        inner_mem = ob.child_by_field_name("member")
+                        if (inner_ob is not None and inner_mem is not None
+                                and inner_ob.type == "identifier"
+                                and text(inner_ob).lower() == "currpage"):
+                            addin = usercontrols.get(text(inner_mem).lower())
+                            if addin:
+                                facts.append({"kind": "calls", "src_line": proc_line,
+                                              "target": addin, "method": text(mem)})
+                    elif ob.type == "identifier":
                         hit = varmap.get(text(ob).lower())
                         if hit and hit[0] in _AL_CODEUNIT_CLASSES:
                             facts.append({"kind": "calls", "src_line": proc_line,
@@ -5251,7 +5269,7 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                             facts.append({"kind": "calls", "src_line": proc_line,
                                           "target": tgt, "method": text(mem)})
         for c in node.children:
-            walk_calls(c, proc_line, varmap)
+            walk_calls(c, proc_line, varmap, usercontrols)
 
     def collect_bindings(node, obj_line: int) -> None:
         # Object→table data bindings: page `SourceTable`, report/query `dataitem`,
@@ -5741,6 +5759,28 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                 collect_vars(c, obj_vars)
         uses: set = {v for v in obj_vars.values() if v[0] in _AL_USES_CLASSES}
 
+        # Page `usercontrol(<ctrl>; <AddIn>)`: a page->add-in usage edge, plus a
+        # control-name -> add-in map so `CurrPage.<ctrl>.<proc>()` calls resolve to
+        # the add-in's procedure (#41). The two identifiers inside the section are
+        # the control name then the add-in type name.
+        usercontrols: dict = {}
+        if obj.type in ("page_declaration", "pageextension_declaration"):
+            def collect_usercontrols(n) -> None:
+                if n.type == "usercontrol_section":
+                    idents = [c for c in n.children
+                              if c.type in ("identifier", "quoted_identifier")]
+                    if len(idents) >= 2:
+                        ctrl = _al_strip_quotes(text(idents[0]))
+                        addin = _al_strip_quotes(text(idents[1]))
+                        if ctrl and addin:
+                            usercontrols[ctrl.lower()] = addin
+                            facts.append({"kind": "usercontrol", "src_line": obj_line,
+                                          "target": addin})
+                    return
+                for c in n.children:
+                    collect_usercontrols(c)
+            collect_usercontrols(body)
+
         pending: list[str] = []
         for c in body.children:
             if c.type == "attribute_item":
@@ -5763,7 +5803,7 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                 uses |= {v for v in vm.values() if v[0] in _AL_USES_CLASSES}
                 pbody = c.child_by_field_name("body")
                 if pbody is not None:
-                    walk_calls(pbody, proc_line, vm)
+                    walk_calls(pbody, proc_line, vm, usercontrols)
             pending = []
 
         if _AL_EMIT_USES:
@@ -6218,6 +6258,7 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
         "binds": "table", "implements": "interface",
         "enum_binds_implementation": "codeunit", "typed_as": "enum",
         "sub_page": "page", "rolecenter": "page",
+        "usercontrol": "controladdin",
     }
 
     # A permissionset grant's object kind maps to the target object's node type,
@@ -6236,12 +6277,13 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
             "enum_binds_implementation": "enum_binds_implementation",
             "transfers_to": "transfers_to", "typed_as": "typed_as",
             "grants": "grants", "sub_page": "subpage",
-            "navigates_to": "navigates_to", "rolecenter": "rolecenter"}
+            "navigates_to": "navigates_to", "rolecenter": "rolecenter",
+            "usercontrol": "usercontrol"}
     _EXTRACTED = frozenset({"extends", "subscribes", "binds", "relates_to",
                             "computes_from", "implements",
                             "enum_binds_implementation", "transfers_to",
                             "typed_as", "grants", "sub_page", "navigates_to",
-                            "rolecenter"})
+                            "rolecenter", "usercontrol"})
 
     # Interface dispatch fans a call on an `Interface "IFoo"`-typed variable out to
     # every object that `implements "IFoo"`. Pre-index implementor node ids by
