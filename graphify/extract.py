@@ -2319,6 +2319,43 @@ def _al_member_name(decl, source: bytes) -> str | None:
     return None
 
 
+def _al_field_attrs(decl, source: bytes) -> dict[str, str]:
+    """Data type + FieldClass of an AL table/tableextension field (#38).
+
+    ``type`` is the raw ``type_specification`` text (``Code[20]``, ``Decimal``,
+    ``Enum "X"``, ...). ``field_class`` is the value of the ``FieldClass``
+    property in the field's ``declaration_body`` (``FlowField`` / ``FlowFilter``);
+    AL defaults an omitted FieldClass to ``Normal``, so that is what we store when
+    the property is absent. Returns only the keys that apply so non-field members
+    are left untouched.
+    """
+    attrs: dict[str, str] = {}
+    for c in decl.children:
+        if c.type == "type_specification":
+            t = _read_text(c, source).strip()
+            if t:
+                attrs["type"] = t
+            break
+    field_class = "Normal"
+    for c in decl.children:
+        if c.type != "declaration_body":
+            continue
+        for p in c.children:
+            if p.type != "property":
+                continue
+            name = None
+            val = None
+            for ch in p.children:
+                if ch.type == "property_name":
+                    name = _read_text(ch, source).strip()
+                elif ch.type in ("identifier", "quoted_identifier") and val is None:
+                    val = _read_text(ch, source).strip()
+            if name and name.lower() == "fieldclass" and val:
+                field_class = val
+    attrs["field_class"] = field_class
+    return attrs
+
+
 def _al_member_id(parent_nid: str, raw_name: str | None, seq: int,
                   used: set[str]) -> tuple[str, bool]:
     """Stable, collision-free member id under ``parent_nid`` (#35).
@@ -3053,6 +3090,15 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
                                  if member_name and _make_id(member_name)
                                  else f".member{seq[0]}")
                         add_node(m_nid, label, m_line)
+                        # #38: table/tableextension fields carry their declared
+                        # data type + FieldClass as node attributes.
+                        if n.type == "field_declaration":
+                            fattrs = _al_field_attrs(n, source)
+                            fnode = nodes[-1] if nodes and nodes[-1]["id"] == m_nid else \
+                                next((x for x in nodes if x["id"] == m_nid), None)
+                            if fnode is not None:
+                                for k, v in fattrs.items():
+                                    fnode.setdefault(k, v)
                         add_edge(parent_nid, m_nid, "contains", m_line)
                         # Recurse INTO the member for nested members, qualified by
                         # this member; nested sequence numbers are scoped per parent.
