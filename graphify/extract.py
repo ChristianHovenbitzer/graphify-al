@@ -2298,7 +2298,7 @@ _AL_MEMBER_TYPES = frozenset({
     "report_dataitem",          # report dataitem (may nest)
     "report_column",            # report dataset column (source-field mapping)
     "query_dataitem",           # query dataitem (may nest)
-    "query_column",             # query column (source-field mapping)
+    "query_column",             # query column (source-field mapping / leaf under a dataitem)
     "xmlport_element",          # xmlport text/table/field element (may nest)
 })
 
@@ -5318,6 +5318,111 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
         for c in node.children:
             collect_page_parts(c)
 
+    def collect_field_lineage(obj) -> None:
+        # Field-level lineage: a query `column` / xmlport `fieldelement` reads a
+        # source field. Emitted from the member's own line so it resolves to the
+        # column/fieldelement member node (not the object). A query column's
+        # source table is its enclosing dataitem's `table_name`; an xmlport
+        # fieldelement's source is `<tableelement-var>.<Field>`, whose table is
+        # the enclosing tableelement's bound `source` (#40).
+        if obj.type == "query_declaration":
+            def walk_q(n, tbl: str) -> None:
+                if n.type == "query_dataitem":
+                    tn = n.child_by_field_name("table_name")
+                    if tn is not None:
+                        tbl = _al_strip_quotes(text(tn))
+                elif n.type == "query_column":
+                    fn = n.child_by_field_name("field_name")
+                    if fn is not None and tbl:
+                        facts.append({"kind": "sources_field", "src_line": line(n),
+                                      "target": tbl,
+                                      "field": _al_strip_quotes(text(fn))})
+                for c in n.children:
+                    walk_q(c, tbl)
+            walk_q(obj, "")
+        elif obj.type == "xmlport_declaration":
+            tablevars: dict[str, str] = {}
+
+            def collect_tablevars(n) -> None:
+                if (n.type == "xmlport_element"
+                        and text(n).split("(", 1)[0].strip().lower() == "tableelement"):
+                    nm = n.child_by_field_name("name")
+                    srcn = n.child_by_field_name("source")
+                    if nm is not None and srcn is not None:
+                        tablevars[_al_strip_quotes(text(nm))] = _al_strip_quotes(text(srcn))
+                for c in n.children:
+                    collect_tablevars(c)
+
+            collect_tablevars(obj)
+
+            def walk_x(n) -> None:
+                if (n.type == "xmlport_element"
+                        and text(n).split("(", 1)[0].strip().lower() == "fieldelement"):
+                    srcn = n.child_by_field_name("source")
+                    if srcn is not None and srcn.type == "member_expression":
+                        ob = srcn.child_by_field_name("object")
+                        mem = srcn.child_by_field_name("member")
+                        if ob is not None and mem is not None:
+                            tbl = tablevars.get(_al_strip_quotes(text(ob)))
+                            if tbl:
+                                facts.append({"kind": "sources_field", "src_line": line(n),
+                                              "target": tbl,
+                                              "field": _al_strip_quotes(text(mem))})
+                for c in n.children:
+                    walk_x(c)
+
+            walk_x(obj)
+
+    def collect_query_joins(obj) -> None:
+        # query dataitem -> dataitem `DataItemLink` join edges. A nested dataitem's
+        # `DataItemLink = <child fld> = <Parent>.<fld>[, ...]` joins it to an
+        # enclosing dataitem named on each comparison's right-hand side (a
+        # member_expression whose `object` is the parent dataitem). Resolve that
+        # parent by name to its declaration line; both endpoints are member nodes,
+        # resolved by line downstream (#40).
+        if obj.type != "query_declaration":
+            return
+
+        def member_exprs(n, out: list) -> None:
+            if n.type == "member_expression":
+                out.append(n)
+            for c in n.children:
+                member_exprs(c, out)
+
+        def walk_j(n, ancestors: dict) -> None:
+            if n.type == "query_dataitem":
+                nm = n.child_by_field_name("name")
+                di_name = _al_strip_quotes(text(nm)).lower() if nm is not None else ""
+                di_line = line(n)
+                body = n.child_by_field_name("body")
+                if body is not None:
+                    for prop in body.children:
+                        if prop.type != "property":
+                            continue
+                        pn = prop.child_by_field_name("name")
+                        if pn is None or text(pn).strip().lower() != "dataitemlink":
+                            continue
+                        mes: list = []
+                        member_exprs(prop, mes)
+                        for me in mes:
+                            pobj = me.child_by_field_name("object")
+                            if pobj is None:
+                                continue
+                            pline = ancestors.get(_al_strip_quotes(text(pobj)).lower())
+                            if pline and pline != di_line:
+                                facts.append({"kind": "dataitem_link",
+                                              "src_line": di_line, "target_line": pline})
+                child_anc = dict(ancestors)
+                if di_name:
+                    child_anc[di_name] = di_line
+                for c in n.children:
+                    walk_j(c, child_anc)
+                return
+            for c in n.children:
+                walk_j(c, ancestors)
+
+        walk_j(obj, {})
+
     def collect_table_relations(node, obj_line: int) -> None:
         # A field's `TableRelation` property names the target table(s). Targets are
         # emitted from the table/tableextension node (fields are not own graph nodes).
@@ -5602,6 +5707,8 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                                   "src_line": obj_line, "target": impl})
                     facts.append({"kind": "implements",
                                   "src_name": impl, "target": iface})
+        collect_field_lineage(obj)
+        collect_query_joins(obj)
         # enum value `Implementation = IFace = Impl` bindings: the enum binds the
         # concrete impl (enum_binds_implementation) and that impl implements IFace.
         # Anchored on the enum VALUE node (its own declaration line), not the enum
@@ -6267,6 +6374,26 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
                                 "source_location": f"L{f.get('src_line', '')}", "weight": 1.0,
                             })
                 continue
+            if f["kind"] == "sources_field":
+                # query column / xmlport fieldelement -> source field node. Source
+                # is the member node (resolved by its own line); target is the
+                # source field in the bound table (real node or external stub).
+                src = line2nid.get(f.get("src_line"))
+                tname = f.get("target")
+                fld = f.get("field")
+                if src and tname and fld:
+                    tgt = resolve_field(tname, fld)
+                    if src != tgt:
+                        pair = (src, tgt, "sources_field")
+                        if pair not in seen:
+                            seen.add(pair)
+                            new_edges.append({
+                                "source": src, "target": tgt, "relation": "sources_field",
+                                "context": "al_sources_field", "confidence": "EXTRACTED",
+                                "confidence_score": 0.9, "source_file": sf,
+                                "source_location": f"L{f.get('src_line', '')}", "weight": 1.0,
+                            })
+                continue
             if f["kind"] == "links_field":
                 # page `action` RunPageLink `= field("Src")`: link the action
                 # member node (this file, by line) to the source page's own
@@ -6286,6 +6413,22 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
                                 "confidence_score": 0.9, "source_file": sf,
                                 "source_location": f"L{f.get('src_line', '')}", "weight": 1.0,
                             })
+                continue
+            if f["kind"] == "dataitem_link":
+                # query child dataitem -> parent dataitem join (DataItemLink). Both
+                # endpoints are member nodes in this file, resolved by line.
+                src = line2nid.get(f.get("src_line"))
+                tgt = line2nid.get(f.get("target_line"))
+                if src and tgt and src != tgt:
+                    pair = (src, tgt, "joins")
+                    if pair not in seen:
+                        seen.add(pair)
+                        new_edges.append({
+                            "source": src, "target": tgt, "relation": "joins",
+                            "context": "al_dataitem_link", "confidence": "EXTRACTED",
+                            "confidence_score": 0.9, "source_file": sf,
+                            "source_location": f"L{f.get('src_line', '')}", "weight": 1.0,
+                        })
                 continue
             tname = f.get("target")
             if not tname:
