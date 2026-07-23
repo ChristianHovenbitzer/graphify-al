@@ -2961,6 +2961,34 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
                                 seen_ids.add(base_nid)
                         add_edge(class_nid, base_nid, "inherits", line)
 
+            # AL-specific: table fields and enum values are first-class members,
+            # each contained by its parent object. Unlike procedures they are
+            # nested below intermediate section nodes (fields_section/fields_body),
+            # where the generic recurse below clears parent_class_nid — so they are
+            # collected here while class_nid is in scope. Keyed parent-qualified,
+            # exactly like procedure nodes; label uses a `.name` form (no `()`) so
+            # method-detecting code and the object-name resolver both skip them.
+            if config.ts_module == "tree_sitter_al":
+                def _al_member_name(decl):
+                    for c in decl.children:
+                        if c.type in ("quoted_identifier", "identifier"):
+                            return _read_text(c, source)
+                    return None
+
+                def _al_collect_members(n):
+                    if n.type in ("field_declaration", "enum_value_declaration"):
+                        member_name = _al_member_name(n)
+                        if member_name:
+                            m_line = n.start_point[0] + 1
+                            m_nid = _make_id(class_nid, member_name)
+                            add_node(m_nid, f".{member_name}", m_line)
+                            add_edge(class_nid, m_nid, "contains", m_line)
+                        return
+                    for c in n.children:
+                        _al_collect_members(c)
+
+                _al_collect_members(node)
+
             # Find body and recurse
             body = _find_body(node, config)
             if body:
