@@ -313,6 +313,41 @@ def _filter_graph_by_context(G: nx.Graph, context_filters: list[str] | None) -> 
     return H
 
 
+def _hop_distances(seeds: list[str], edges: list[tuple]) -> dict[str, int]:
+    """Reconstruct each node's hop-distance from the nearest seed from an edge list.
+
+    Both _bfs and _dfs append an edge (u, v) to their edges_seen list only once
+    u itself has already been popped/expanded, which is always after u's own
+    distance has been resolved (as a seed, or via an earlier edge in the same
+    list). So a single forward pass over edges in emission order is sufficient
+    -- for _bfs this recovers the exact BFS shortest-hop distance; for _dfs it
+    recovers distance along that specific traversal path.
+    """
+    dist = {s: 0 for s in seeds}
+    for u, v in edges:
+        if v not in dist and u in dist:
+            dist[v] = dist[u] + 1
+    return dist
+
+
+def _all_neighbors(G: nx.Graph, n: str) -> set[str]:
+    """Neighbors of n, following edges in either direction on a directed graph.
+
+    Production graphs always load as directed (see _load_graph), and most
+    references/table_relation/calls edges point FROM a consumer TO the
+    concept it depends on (e.g. GenJnlPostLine --references--> Customer) --
+    not the other way. A BFS/DFS starting at Customer that only follows
+    G.neighbors() (successors on a DiGraph) would never reach GenJnlPostLine
+    even though it's one hop away, because the edge points the "wrong" way
+    for outward-only traversal. shortest_path already works around this with
+    G.to_undirected(); _bfs/_dfs need the same treatment to explore "what
+    references this concept", not just "what this concept points to".
+    """
+    if G.is_directed():
+        return set(G.successors(n)) | set(G.predecessors(n))
+    return set(G.neighbors(n))
+
+
 def _bfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], list[tuple]]:
     # Compute hub threshold: nodes above this degree are not expanded as transit.
     # p99 of degree distribution, floored at 50 to avoid over-blocking small graphs.
@@ -334,7 +369,7 @@ def _bfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], lis
             # is the starting node should still be explored).
             if n not in seed_set and G.degree(n) >= hub_threshold:
                 continue
-            for neighbor in G.neighbors(n):
+            for neighbor in _all_neighbors(G, n):
                 if neighbor not in visited:
                     next_frontier.add(neighbor)
                     edges_seen.append((n, neighbor))
@@ -362,24 +397,49 @@ def _dfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], lis
         visited.add(node)
         if node not in seed_set and G.degree(node) >= hub_threshold:
             continue
-        for neighbor in G.neighbors(node):
+        for neighbor in _all_neighbors(G, node):
             if neighbor not in visited:
                 stack.append((neighbor, d + 1))
                 edges_seen.append((node, neighbor))
     return visited, edges_seen
 
 
-def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_budget: int = 2000, *, seeds: list[str] | None = None) -> str:
+def _subgraph_to_text(
+    G: nx.Graph,
+    nodes: set[str],
+    edges: list[tuple],
+    token_budget: int = 6000,
+    *,
+    seeds: list[str] | None = None,
+    distances: dict[str, int] | None = None,
+    scores: dict[str, float] | None = None,
+) -> str:
     """Render subgraph as text, cutting at token_budget (approx 3 chars/token).
 
-    seeds: exact-match nodes rendered first before the degree-sorted expansion,
-    so the queried symbol always appears at the top of the output.
+    seeds: exact-match nodes rendered first before the ranked expansion, so
+    the queried symbol always appears at the top of the output.
+
+    distances/scores: optional hop-distance-from-seed and query-relevance
+    maps (see _hop_distances / _score_nodes). Without them every node ties on
+    both keys and the sort degrades to the previous degree-only ordering --
+    with them, a node that's one hop from the seed and actually matches the
+    query outranks an unrelated hub node with a higher raw degree, which pure
+    degree-sorting got backwards (a directly relevant answer could be buried
+    behind hundreds of high-connectivity nodes and cut off by token_budget
+    before ever being rendered).
     """
     char_budget = token_budget * 3
     lines = []
     seed_set = set(seeds or [])
+    distances = distances or {}
+    scores = scores or {}
+    far = len(G) + 1
+
+    def _rank_key(n: str) -> tuple:
+        return (distances.get(n, far), -scores.get(n, 0.0), -G.degree(n))
+
     ordered = [n for n in (seeds or []) if n in nodes] + \
-              sorted(nodes - seed_set, key=lambda n: G.degree(n), reverse=True)
+              sorted(nodes - seed_set, key=_rank_key)
     for nid in ordered:
         d = G.nodes[nid]
         # Every LLM-derived field passes through sanitize_label before being
@@ -396,15 +456,27 @@ def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_bu
         lines.append(line)
     for u, v in edges:
         if u in nodes and v in nodes:
-            raw = G[u][v]
+            # _bfs/_dfs now traverse edges in either direction (_all_neighbors),
+            # so the (u, v) discovery order doesn't necessarily match the real
+            # edge direction on a directed graph -- look up whichever direction
+            # actually exists and render using the graph's real source/target,
+            # not the traversal order, so e.g. a `references` edge doesn't get
+            # printed backwards.
+            if G.has_edge(u, v):
+                src_id, tgt_id = u, v
+            elif G.has_edge(v, u):
+                src_id, tgt_id = v, u
+            else:
+                continue
+            raw = G[src_id][tgt_id]
             d = next(iter(raw.values()), {}) if isinstance(G, (nx.MultiGraph, nx.MultiDiGraph)) else raw
             context = d.get("context")
             context_suffix = f" context={sanitize_label(str(context))}" if context else ""
             line = (
-                f"EDGE {sanitize_label(G.nodes[u].get('label', u))} "
+                f"EDGE {sanitize_label(G.nodes[src_id].get('label', src_id))} "
                 f"--{sanitize_label(str(d.get('relation', '')))} "
                 f"[{sanitize_label(str(d.get('confidence', '')))}{context_suffix}]--> "
-                f"{sanitize_label(G.nodes[v].get('label', v))}"
+                f"{sanitize_label(G.nodes[tgt_id].get('label', tgt_id))}"
             )
             lines.append(line)
     output = "\n".join(lines)
@@ -428,7 +500,7 @@ def _query_graph_text(
     *,
     mode: str = "bfs",
     depth: int = 3,
-    token_budget: int = 2000,
+    token_budget: int = 6000,
     context_filters: list[str] | None = None,
 ) -> str:
     terms = _query_terms(question)
@@ -447,7 +519,38 @@ def _query_graph_text(
         header_parts.append(f"Context: {', '.join(resolved_filters)} ({filter_source})")
     header_parts.append(f"{len(nodes)} nodes found")
     header = " | ".join(header_parts) + "\n\n"
-    return header + _subgraph_to_text(traversal_graph, nodes, edges, token_budget)
+    distances = _hop_distances(start_nodes, edges)
+    score_map = {nid: score for score, nid in _rank_scores(G, terms, start_nodes, scored)}
+    return header + _subgraph_to_text(
+        traversal_graph, nodes, edges, token_budget,
+        seeds=start_nodes, distances=distances, scores=score_map,
+    )
+
+
+def _rank_scores(
+    G: nx.Graph, terms: list[str], start_nodes: list[str], seed_scored: list[tuple[float, str]]
+) -> list[tuple[float, str]]:
+    """Re-score nodes for ranking, dropping query terms every seed already satisfies.
+
+    A term present in every picked seed's own label adds zero discriminating
+    signal among that seed's neighbors -- they're all tautologically "about"
+    the seed by definition of being connected to it -- but it still inflates
+    the score of an unrelated same-file sibling over the actually-relevant
+    cross-object answer (e.g. querying "customer posting logic" from seed
+    `Customer`: every 1-hop neighbor trivially matches "customer", so an
+    irrelevant `Customer.CreateAndShowNewInvoice()` outscores the real
+    `Gen. Jnl.-Post Line` on that term alone, even though "posting"/"logic"
+    are what should differentiate them). Falls back to the seed-picking score
+    if every term is seed-satisfied (no better signal available).
+    """
+    seed_labels = [
+        (G.nodes[s].get("norm_label") or _strip_diacritics(G.nodes[s].get("label") or "")).lower()
+        for s in start_nodes
+    ]
+    ranking_terms = [t for t in terms if not all(t.lower() in sl for sl in seed_labels)]
+    if not ranking_terms or not seed_labels:
+        return seed_scored
+    return _score_nodes(G, ranking_terms)
 
 
 def _find_node(G: nx.Graph, label: str) -> list[str]:
@@ -511,13 +614,19 @@ def _filter_blank_stdin() -> None:
     sys.stdin = open(0, "r", closefd=False)
 
 
-def _build_server(graph_path: str):
+def _build_server(graph_path: str, *, instructions: str | None = None):
     """Build the configured low-level MCP Server (shared by every transport).
 
     All graph query tools and resources are registered here over a single
     ``mcp.server.Server`` instance; the caller picks the transport (stdio or
     Streamable HTTP) and runs it. Hot-reload of graph.json works the same way
     regardless of transport, since reloads happen inside the tool handlers.
+
+    ``instructions`` is deliberately not domain-specific here -- graphify is a
+    general-purpose graph server. Callers serving a particular corpus (e.g. a
+    specific codebase) should pass their own description via this parameter
+    (or ``--instructions``/``GRAPHIFY_INSTRUCTIONS`` on the CLI) so an agent
+    with zero prior context knows what graph it's actually looking at.
     """
     import threading
 
@@ -566,7 +675,7 @@ def _build_server(graph_path: str):
             communities = _communities_from_graph(new_G)
             _reload_state["mtime_ns"], _reload_state["size"] = key
 
-    server = Server("graphify")
+    server = Server("graphify", instructions=instructions)
 
     @server.list_tools()
     async def list_tools() -> list[types.Tool]:
@@ -581,7 +690,7 @@ def _build_server(graph_path: str):
                         "mode": {"type": "string", "enum": ["bfs", "dfs"], "default": "bfs",
                                  "description": "bfs=broad context, dfs=trace a specific path"},
                         "depth": {"type": "integer", "default": 3, "description": "Traversal depth (1-6)"},
-                        "token_budget": {"type": "integer", "default": 2000, "description": "Max output tokens"},
+                        "token_budget": {"type": "integer", "default": 6000, "description": "Max output tokens"},
                         "context_filter": {
                             "type": "array",
                             "items": {"type": "string"},
@@ -698,7 +807,7 @@ def _build_server(graph_path: str):
         question = arguments["question"]
         mode = arguments.get("mode", "bfs")
         depth = min(int(arguments.get("depth", 3)), 6)
-        budget = int(arguments.get("token_budget", 2000))
+        budget = int(arguments.get("token_budget", 6000))
         context_filter = arguments.get("context_filter")
         _t0 = _time.perf_counter()
         result = _query_graph_text(
@@ -1039,7 +1148,7 @@ def _build_server(graph_path: str):
     return server
 
 
-def serve(graph_path: str | None = None) -> None:
+def serve(graph_path: str | None = None, *, instructions: str | None = None) -> None:
     """Start the MCP server over stdio (the default, per-developer transport)."""
     graph_path = graph_path or _default_graph_json()
     try:
@@ -1048,7 +1157,7 @@ def serve(graph_path: str | None = None) -> None:
         raise ImportError('mcp not installed. Run: pip install "graphifyy[mcp]"') from e
     import asyncio
 
-    server = _build_server(graph_path)
+    server = _build_server(graph_path, instructions=instructions)
 
     async def main() -> None:
         async with stdio_server() as streams:
@@ -1125,6 +1234,7 @@ def _build_http_app(
     json_response: bool = False,
     stateless: bool = False,
     session_timeout: float | None = 3600.0,
+    instructions: str | None = None,
 ):
     """Build the Starlette ASGI app for the Streamable HTTP transport.
 
@@ -1155,7 +1265,7 @@ def _build_http_app(
     # mistaken for "auth on" — normalize it to None so the gate is unambiguous.
     api_key = (api_key or "").strip() or None
 
-    server = _build_server(graph_path)
+    server = _build_server(graph_path, instructions=instructions)
 
     # DNS-rebinding protection. When the operator binds a wildcard address they
     # are intentionally exposing the server, so accept any Host header; for a
@@ -1207,6 +1317,7 @@ def serve_http(
     json_response: bool = False,
     stateless: bool = False,
     session_timeout: float | None = 3600.0,
+    instructions: str | None = None,
 ) -> None:
     """Start the MCP server over Streamable HTTP (MCP spec 2025-03-26).
 
@@ -1239,6 +1350,7 @@ def serve_http(
         json_response=json_response,
         stateless=stateless,
         session_timeout=session_timeout,
+        instructions=instructions,
     )
 
     auth_note = "api-key required" if api_key else "no auth (set --api-key to require one)"
@@ -1306,6 +1418,17 @@ def _main(argv: list[str] | None = None) -> None:
         default=3600.0,
         help="Reap stateful sessions idle this many seconds (default: 3600; 0 disables)",
     )
+    parser.add_argument(
+        "--instructions",
+        default=os.environ.get("GRAPHIFY_INSTRUCTIONS"),
+        help=(
+            "MCP server instructions describing what graph/corpus this is "
+            "(env: GRAPHIFY_INSTRUCTIONS). graphify is corpus-agnostic, so "
+            "this is unset by default -- set it when serving a specific "
+            "codebase so an agent with no prior context knows what it's "
+            "looking at."
+        ),
+    )
     args = parser.parse_args(argv)
     graph_path = args.graph_flag or args.graph_path or _default_graph_json()
 
@@ -1319,9 +1442,10 @@ def _main(argv: list[str] | None = None) -> None:
             json_response=args.json_response,
             stateless=args.stateless,
             session_timeout=args.session_timeout,
+            instructions=args.instructions,
         )
     else:
-        serve(graph_path)
+        serve(graph_path, instructions=args.instructions)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,9 @@ from graphify.serve import (
     _pick_seeds,
     _bfs,
     _dfs,
+    _all_neighbors,
+    _hop_distances,
+    _rank_scores,
     _find_node,
     _filter_graph_by_context,
     _infer_context_filters,
@@ -221,6 +224,101 @@ def test_dfs_full_chain():
     assert {"n1", "n2", "n3", "n4"}.issubset(visited)
 
 
+# --- directed-graph traversal (production always loads DiGraph -- see _load_graph) ---
+#
+# _make_graph() above is undirected, which is why this whole file's BFS/DFS
+# tests never caught the real bug: on a DiGraph, most references/table_relation
+# edges point FROM the consumer TO the concept it depends on (e.g.
+# GenJnlPostLine --references--> Customer), so a BFS/DFS starting AT the
+# concept and only following G.neighbors() (successors) could never reach its
+# consumers, even one hop away.
+
+def _make_digraph() -> nx.DiGraph:
+    G = nx.DiGraph()
+    G.add_node("customer", label="Customer", source_file="Customer.Table.al", source_location="L66", community=0)
+    G.add_node("gen_jnl_post_line", label="Gen. Jnl.-Post Line", source_file="GenJnlPostLine.Codeunit.al", source_location="L73", community=0)
+    G.add_node("unrelated", label="Unrelated", source_file="Unrelated.Codeunit.al", source_location="L1", community=1)
+    # Edge points consumer -> concept, same direction as the real corpus.
+    G.add_edge("gen_jnl_post_line", "customer", relation="references", confidence="INFERRED", context="al_uses")
+    return G
+
+
+def test_all_neighbors_follows_incoming_edges_on_digraph():
+    G = _make_digraph()
+    assert _all_neighbors(G, "customer") == {"gen_jnl_post_line"}
+
+
+def test_all_neighbors_matches_plain_neighbors_on_undirected_graph():
+    G = _make_graph()
+    assert _all_neighbors(G, "n1") == set(G.neighbors("n1"))
+
+
+def test_bfs_from_concept_reaches_consumer_via_incoming_edge():
+    G = _make_digraph()
+    visited, edges = _bfs(G, ["customer"], depth=1)
+    assert "gen_jnl_post_line" in visited
+    assert "unrelated" not in visited
+
+
+def test_dfs_from_concept_reaches_consumer_via_incoming_edge():
+    G = _make_digraph()
+    visited, edges = _dfs(G, ["customer"], depth=1)
+    assert "gen_jnl_post_line" in visited
+
+
+def test_subgraph_to_text_renders_real_edge_direction_not_traversal_order():
+    G = _make_digraph()
+    visited, edges = _bfs(G, ["customer"], depth=1)
+    text = _subgraph_to_text(G, visited, edges, seeds=["customer"])
+    # The real edge is gen_jnl_post_line --references--> customer, discovered
+    # while traversing customer -> gen_jnl_post_line; the rendered edge must
+    # reflect the graph's real direction, not the discovery order.
+    assert "EDGE Gen. Jnl.-Post Line --references" in text
+    assert "-->" in text
+    assert "EDGE Customer --references" not in text
+
+
+# --- _hop_distances ---
+
+def test_hop_distances_seed_is_zero():
+    dist = _hop_distances(["n1"], [("n1", "n2"), ("n2", "n3")])
+    assert dist["n1"] == 0
+    assert dist["n2"] == 1
+    assert dist["n3"] == 2
+
+def test_hop_distances_multiple_seeds():
+    dist = _hop_distances(["a", "b"], [("a", "x"), ("b", "y")])
+    assert dist == {"a": 0, "b": 0, "x": 1, "y": 1}
+
+
+# --- _subgraph_to_text ranking (distances/scores) ---
+
+def test_subgraph_to_text_ranks_closer_node_over_higher_degree_node():
+    G = _make_graph()
+    # n3 has higher degree (2 edges: n2-n3, n3-n4) than n4 (1 edge), so the
+    # old degree-only sort would put n3 first regardless of distance from
+    # seed n1. With distances supplied, the closer node (n2, 1 hop) must
+    # still win over a farther, higher-degree node.
+    text = _subgraph_to_text(
+        G, {"n1", "n2", "n3"}, [("n1", "n2"), ("n2", "n3")],
+        seeds=["n1"], distances={"n1": 0, "n2": 1, "n3": 2},
+    )
+    n2_pos = text.index("NODE cluster")
+    n3_pos = text.index("NODE build")
+    assert n2_pos < n3_pos
+
+def test_subgraph_to_text_without_distances_falls_back_to_degree_order():
+    # No distances/scores passed -> must be byte-identical to the pre-fix
+    # degree-only behavior other callers may still rely on.
+    G = _make_graph()
+    text = _subgraph_to_text(G, {"n1", "n2", "n3", "n4"}, [("n1", "n2"), ("n2", "n3"), ("n3", "n4")])
+    text_explicit_none = _subgraph_to_text(
+        G, {"n1", "n2", "n3", "n4"}, [("n1", "n2"), ("n2", "n3"), ("n3", "n4")],
+        distances=None, scores=None,
+    )
+    assert text == text_explicit_none
+
+
 # --- _subgraph_to_text ---
 
 def test_subgraph_to_text_contains_labels():
@@ -262,6 +360,56 @@ def test_query_graph_text_heuristic_context_filter_changes_traversal():
     assert "Context: call (heuristic)" in text
     assert "cluster" in text
     assert "build" not in text
+
+
+# --- _rank_scores: dropping seed-tautological terms from ranking ---
+#
+# A term present in the seed's own label matches EVERY one-hop neighbor
+# equally (that's how they got connected), so it's a tautology, not a
+# discriminating signal -- but left in, it lets an unrelated same-file
+# sibling outscore the actually-relevant cross-object answer purely because
+# they happen to share a source file with the seed. Modeled on the real
+# corpus: seed "Widget" has a same-file sibling "Foo" whose only positive
+# score comes from the source path containing "widget", vs. a genuinely
+# relevant "Task Handler" that matches the differentiating term "task".
+
+def _make_seed_bias_digraph() -> nx.DiGraph:
+    G = nx.DiGraph()
+    G.add_node("seed_widget", label="Widget", source_file="Widget.Table.al", source_location="L1", community=0)
+    G.add_node("widget_foo", label="Foo", source_file="Widget.Table.al", source_location="L10", community=0)
+    G.add_node("task_handler", label="Task Handler", source_file="Handlers/TaskHandler.al", source_location="L1", community=0)
+    G.add_edge("widget_foo", "seed_widget", relation="references", confidence="INFERRED")
+    G.add_edge("task_handler", "seed_widget", relation="references", confidence="INFERRED")
+    return G
+
+
+def test_rank_scores_drops_seed_satisfied_term():
+    G = _make_seed_bias_digraph()
+    terms = _query_terms("widget task")
+    scored = _score_nodes(G, terms)
+    seed_scores = {nid: s for s, nid in scored}
+    assert seed_scores.get("widget_foo", 0.0) > 0  # matches "widget" via source path only
+
+    ranked = _rank_scores(G, terms, ["seed_widget"], scored)
+    rank_scores = {nid: s for s, nid in ranked}
+    assert rank_scores.get("widget_foo", 0.0) == 0.0  # "widget" dropped -> no signal left
+    assert rank_scores.get("task_handler", 0.0) > 0  # "task" untouched -> still scores
+
+
+def test_rank_scores_falls_back_when_every_term_is_seed_satisfied():
+    G = _make_seed_bias_digraph()
+    terms = _query_terms("widget")
+    scored = _score_nodes(G, terms)
+    ranked = _rank_scores(G, terms, ["seed_widget"], scored)
+    assert ranked == scored
+
+
+def test_query_graph_text_ranks_differentiating_term_over_seed_tautology():
+    G = _make_seed_bias_digraph()
+    text = _query_graph_text(G, "widget task", mode="bfs", depth=1, token_budget=2000)
+    # Without the fix, widget_foo's spurious "widget"-in-source match would
+    # outrank task_handler's real, differentiating "task" match.
+    assert text.index("NODE Task Handler") < text.index("NODE Foo")
 
 
 # --- _load_graph ---
