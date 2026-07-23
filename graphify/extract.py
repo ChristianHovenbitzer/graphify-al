@@ -4855,6 +4855,23 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
         for c in node.children:
             collect_table_relations(c, obj_line)
 
+    def walk_calc_formulas(node, obj_line: int) -> None:
+        # FlowField CalcFormula (sum/count/exist/average/min/max -> aggregate_formula,
+        # lookup -> lookup_formula) each carry a `calc_field_reference` naming the
+        # source table and, optionally, the source field ("Table".Field).
+        if node.type == "calc_field_reference":
+            names = [c for c in node.children
+                     if c.type in ("quoted_identifier", "identifier")]
+            if names:
+                tbl = _al_strip_quotes(text(names[0]))
+                fld = _al_strip_quotes(text(names[1])) if len(names) > 1 else ""
+                if tbl:
+                    facts.append({"kind": "computes_from", "src_line": obj_line,
+                                  "target": tbl, "field": fld})
+            return
+        for c in node.children:
+            walk_calc_formulas(c, obj_line)
+
     def walk_obj(obj) -> None:
         obj_line = line(obj)
         base = obj.child_by_field_name("base_object")
@@ -4863,6 +4880,7 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                           "target": _al_strip_quotes(text(base))})
         if obj.type in ("table_declaration", "tableextension_declaration"):
             collect_table_relations(obj, obj_line)
+        walk_calc_formulas(obj, obj_line)
         body = obj.child_by_field_name("body")
         if body is None:
             return
@@ -4963,7 +4981,7 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
 
     _REL = {"extends": "extends", "subscribes": "subscribes",
             "calls": "calls", "uses": "references", "binds": "binds",
-            "relates_to": "relates_to"}
+            "relates_to": "relates_to", "computes_from": "computes_from"}
     new_edges: list[dict] = []
     seen: set = set()
     for result in per_file:
@@ -5023,13 +5041,18 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
             if pair in seen:
                 continue
             seen.add(pair)
-            new_edges.append({
+            edge = {
                 "source": src, "target": tgt, "relation": rel,
                 "context": "al_" + f["kind"],
-                "confidence": "EXTRACTED" if f["kind"] in ("extends", "subscribes", "binds", "relates_to") else "INFERRED",
+                "confidence": "EXTRACTED"
+                if f["kind"] in ("extends", "subscribes", "binds", "relates_to", "computes_from")
+                else "INFERRED",
                 "confidence_score": 0.9, "source_file": sf,
                 "source_location": f"L{f.get('src_line', '')}", "weight": 1.0,
-            })
+            }
+            if f["kind"] == "computes_from" and f.get("field"):
+                edge["member"] = f["field"]  # source field (fields are not graph nodes)
+            new_edges.append(edge)
     all_nodes.extend(new_nodes)
     return new_edges
 

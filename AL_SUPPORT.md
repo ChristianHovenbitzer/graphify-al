@@ -46,6 +46,7 @@ are `.ProcName()`. `examples/` has a tiny synthetic app you can build and query 
 | `calls` | intra-object procedure calls, **plus** type-resolved cross-object Codeunit calls (`MyCdu.DoThing()` resolved via the variable's declared type) |
 | `subscribes` | `[EventSubscriber]` → the publisher object named in the attribute (objects outside the analyzed corpus become tagged `external` nodes — the integration surface) |
 | `extends` | `tableextension` / `pageextension` / etc. → its base object |
+| `computes_from` | a table's FlowField `CalcFormula` (`Sum`/`Count`/`Exist`/`Lookup`/`Average`/`Min`/`Max`) → the source table it aggregates (source field kept on the edge; tables outside the corpus become tagged `external` nodes) |
 | `imports` | `using` namespace directives |
 
 ## Honest limitations
