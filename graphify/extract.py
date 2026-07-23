@@ -4705,6 +4705,11 @@ _AL_OBJ_TYPE_RE = re.compile(
 _AL_CODEUNIT_CLASSES = frozenset({"codeunit"})
 _AL_USES_CLASSES = frozenset({"record", "page", "report", "query", "xmlport"})
 
+# Built-in indirect dispatch: Codeunit.Run(Codeunit::"X"), Page.RunModal(Page::"Y"),
+# Report.Run(Report::"Z"). The object keyword parses as a `keyword_identifier`.
+_AL_RUN_KEYWORDS = frozenset({"codeunit", "page", "report"})
+_AL_RUN_METHODS = frozenset({"run", "runmodal"})
+
 # EventSubscriber(ObjectType::Codeunit, Codeunit::"Name" | Database::"Name" | 80,
 #                 'OnEvent' | OnEvent, ...)
 _AL_EVENT_RE = re.compile(
@@ -4804,17 +4809,49 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                     if obj:
                         out[text(nm).lower()] = obj
 
+    def run_dispatch_target(call_node, objclass: str):
+        # First argument of Codeunit.Run/Page.RunModal/Report.Run names the target:
+        # an object reference (Codeunit::"X") or a bare numeric base-object id.
+        args = call_node.child_by_field_name("arguments")
+        if args is None:
+            return None
+        for a in args.children:
+            if not a.is_named:
+                continue
+            if a.type == "database_reference":
+                tn = a.child_by_field_name("table_name")
+                return _al_strip_quotes(text(tn)) if tn is not None else None
+            if a.type == "integer":
+                return f"{objclass} {text(a)}"  # numeric base-object id
+            return None  # first real arg is not an object -> can't resolve statically
+        return None
+
     def walk_calls(node, proc_line: int, varmap: dict) -> None:
         if node.type == "call_expression":
             fn = node.child_by_field_name("function")
             if fn is not None and fn.type == "member_expression":
                 ob = fn.child_by_field_name("object")
                 mem = fn.child_by_field_name("member")
-                if ob is not None and mem is not None and ob.type == "identifier":
-                    hit = varmap.get(text(ob).lower())
-                    if hit and hit[0] in _AL_CODEUNIT_CLASSES:
-                        facts.append({"kind": "calls", "src_line": proc_line,
-                                      "target": hit[1], "method": text(mem)})
+                if ob is not None and mem is not None:
+                    if ob.type == "identifier":
+                        hit = varmap.get(text(ob).lower())
+                        if hit and hit[0] in _AL_CODEUNIT_CLASSES:
+                            facts.append({"kind": "calls", "src_line": proc_line,
+                                          "target": hit[1], "method": text(mem)})
+                        elif hit and hit[0] == "interface":
+                            # Interface dispatch: MyVar.Method() on an
+                            # `Interface "IFoo"`-typed variable. The concrete target
+                            # is unknown statically, so resolution fans the call out
+                            # to every object that `implements "IFoo"`.
+                            facts.append({"kind": "iface_calls", "src_line": proc_line,
+                                          "target": hit[1], "method": text(mem)})
+                    elif (ob.type == "keyword_identifier"
+                          and text(ob).lower() in _AL_RUN_KEYWORDS
+                          and text(mem).lower() in _AL_RUN_METHODS):
+                        tgt = run_dispatch_target(node, text(ob))
+                        if tgt:
+                            facts.append({"kind": "calls", "src_line": proc_line,
+                                          "target": tgt, "method": text(mem)})
         for c in node.children:
             walk_calls(c, proc_line, varmap)
 
@@ -5200,6 +5237,35 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
     _EXTRACTED = frozenset({"extends", "subscribes", "binds", "relates_to",
                             "computes_from", "implements",
                             "enum_binds_implementation"})
+
+    # Interface dispatch fans a call on an `Interface "IFoo"`-typed variable out to
+    # every object that `implements "IFoo"`. Pre-index implementor node ids by
+    # interface name (both `implements` clauses and enum `Implementation` bindings).
+    implementors_by_iface: dict[str, list[str]] = {}
+    for result in per_file:
+        if not isinstance(result, dict):
+            continue
+        facts = result.get("al_facts")
+        if not facts:
+            continue
+        l2n: dict[int, str] = {}
+        for n in result.get("nodes", []):
+            loc = str(n.get("source_location", ""))
+            if loc[:1] == "L" and not str(n.get("label", "")).endswith(".al"):
+                try:
+                    l2n.setdefault(int(loc[1:]), n["id"])
+                except ValueError:
+                    pass
+        for f in facts:
+            if f.get("kind") != "implements":
+                continue
+            iface = _al_strip_quotes(str(f.get("target", ""))).lower()
+            sn = f.get("src_name")
+            src = (obj_by_name.get(_al_strip_quotes(sn).lower()) if sn
+                   else l2n.get(f.get("src_line")))
+            if iface and src:
+                implementors_by_iface.setdefault(iface, []).append(src)
+
     new_edges: list[dict] = []
     seen: set = set()
     for result in per_file:
@@ -5237,6 +5303,28 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
                 node = line2node.get(f.get("src_line"))
                 if node is not None:
                     node["event"] = f["event_type"]
+                continue
+            if f["kind"] == "iface_calls":
+                # Fan out to `Method` on every object implementing the interface,
+                # landing on the concrete procedure when it exists (else the object).
+                src = line2nid.get(f.get("src_line"))
+                iface = _al_strip_quotes(str(f.get("target", ""))).lower()
+                meth = str(f.get("method", "")).lower()
+                if src and iface:
+                    for impl in implementors_by_iface.get(iface, ()):
+                        tgt = proc_by_objmeth.get((impl, meth), impl)
+                        if src == tgt:
+                            continue
+                        pair = (src, tgt, "calls")
+                        if pair in seen:
+                            continue
+                        seen.add(pair)
+                        new_edges.append({
+                            "source": src, "target": tgt, "relation": "calls",
+                            "context": "al_iface_calls", "confidence": "INFERRED",
+                            "confidence_score": 0.9, "source_file": sf,
+                            "source_location": f"L{f.get('src_line', '')}", "weight": 1.0,
+                        })
                 continue
             tname = f.get("target")
             if not tname:
