@@ -4845,6 +4845,27 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                             # to every object that `implements "IFoo"`.
                             facts.append({"kind": "iface_calls", "src_line": proc_line,
                                           "target": hit[1], "method": text(mem)})
+                        elif (hit and hit[0] == "record"
+                              and text(mem).lower() == "transferfields"):
+                            # Dest.TransferFields(Source) copies like-named fields
+                            # between records: an implicit source-table -> dest-table
+                            # data-flow link. Resolve the first argument's record type
+                            # via the same var/parameter type table; skip when it is
+                            # Rec/xRec or any non-record the type table can't resolve.
+                            srctbl = None
+                            args = node.child_by_field_name("arguments")
+                            if args is not None:
+                                for a in args.children:
+                                    if not a.is_named:
+                                        continue
+                                    if a.type == "identifier":
+                                        ahit = varmap.get(text(a).lower())
+                                        if ahit and ahit[0] == "record":
+                                            srctbl = ahit[1]
+                                    break  # only the first argument is the source
+                            if srctbl:
+                                facts.append({"kind": "transfers_to", "src_line": proc_line,
+                                              "src_name": srctbl, "target": hit[1]})
                     elif (ob.type == "keyword_identifier"
                           and text(ob).lower() in _AL_RUN_KEYWORDS
                           and text(mem).lower() in _AL_RUN_METHODS):
@@ -5233,10 +5254,11 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
             "calls": "calls", "uses": "references", "binds": "binds",
             "relates_to": "relates_to", "computes_from": "computes_from",
             "implements": "implements",
-            "enum_binds_implementation": "enum_binds_implementation"}
+            "enum_binds_implementation": "enum_binds_implementation",
+            "transfers_to": "transfers_to"}
     _EXTRACTED = frozenset({"extends", "subscribes", "binds", "relates_to",
                             "computes_from", "implements",
-                            "enum_binds_implementation"})
+                            "enum_binds_implementation", "transfers_to"})
 
     # Interface dispatch fans a call on an `Interface "IFoo"`-typed variable out to
     # every object that `implements "IFoo"`. Pre-index implementor node ids by
