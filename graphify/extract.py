@@ -4801,6 +4801,159 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
     return facts
 
 
+def _al_string_literal(text: str) -> str:
+    """AL single-quoted string literal -> its text ('' -> ')."""
+    s = text.strip()
+    if len(s) >= 2 and s[0] == "'" and s[-1] == "'":
+        return s[1:-1].replace("''", "'")
+    return s
+
+
+def _al_parse_doc(comments: list[str]) -> str:
+    """Turn a run of `///` XML-doc comment lines into a single summary string.
+
+    Prefers the `<summary>` element's text; falls back to the joined comment
+    body. All XML tags are stripped and whitespace collapsed.
+    """
+    body = " ".join(c.lstrip().lstrip("/").strip() for c in comments)
+    m = re.search(r"<summary>(.*?)</summary>", body, re.IGNORECASE | re.DOTALL)
+    inner = m.group(1) if m else body
+    inner = re.sub(r"<[^>]+>", " ", inner)
+    return " ".join(inner.split())
+
+
+def _al_collect_node_text(tree, source: bytes) -> dict[int, dict]:
+    """Map a source line -> human-facing text attributes for the node on it.
+
+    Collects AL `Caption` / `ToolTip` property values (`caption` / `tooltip`),
+    `Label` datatype text (`al_label` — `label` is the reserved display-name key),
+    and `///` XML-doc `<summary>` comments (`doc`), keyed by the declaration line of
+    the graph node they belong to (object line or procedure line). Field-level
+    Caption/ToolTip have no dedicated graph node, so they attach to the enclosing
+    object node (object-level values win; first field otherwise).
+    """
+    out: dict[int, dict] = {}
+
+    def text(n) -> str:
+        return source[n.start_byte:n.end_byte].decode("utf-8", "replace")
+
+    def line(n) -> int:
+        return n.start_point[0] + 1
+
+    def put(ln: int, key: str, val: str) -> None:
+        if val:
+            out.setdefault(ln, {}).setdefault(key, val)
+
+    def prop_kv(prop):
+        name = None
+        val = None
+        for ch in prop.children:
+            if ch.type == "property_name":
+                name = text(ch)
+            elif ch.type == "string_literal" and val is None:
+                val = _al_string_literal(text(ch))
+        return name, val
+
+    def preceding_doc(node):
+        buf: list[str] = []
+        sib = node.prev_sibling
+        while sib is not None and sib.type == "comment":
+            t = text(sib)
+            if t.lstrip().startswith("///"):
+                buf.append(t)
+                sib = sib.prev_sibling
+            else:
+                break
+        if not buf:
+            return None
+        buf.reverse()
+        return _al_parse_doc(buf)
+
+    def obj_body(obj):
+        for c in obj.children:
+            if c.type in ("declaration_body", "code_block", "statement_block"):
+                return c
+        return None
+
+    def collect_field(fd, oline: int) -> None:
+        for c in fd.children:
+            if c.type != "declaration_body":
+                continue
+            for p in c.children:
+                if p.type == "property":
+                    name, val = prop_kv(p)
+                    if not name or not val:
+                        continue
+                    lname = name.lower()
+                    if lname == "caption":
+                        put(oline, "caption", val)
+                    elif lname == "tooltip":
+                        put(oline, "tooltip", val)
+
+    def collect_labels(section, oline: int) -> None:
+        for vb in section.children:
+            if vb.type != "var_body":
+                continue
+            for vd in vb.children:
+                if vd.type != "variable_declaration":
+                    continue
+                is_label = any(
+                    ch.type == "basic_type" and text(ch).lower() == "label"
+                    for ch in vd.children
+                )
+                if not is_label:
+                    continue
+                for ch in vd.children:
+                    if ch.type == "string_literal":
+                        # `label` is the reserved graph display-name key, so the
+                        # AL `Label` datatype text is exposed as `al_label`.
+                        put(oline, "al_label", _al_string_literal(text(ch)))
+                        break
+
+    def handle_object(obj) -> None:
+        oline = line(obj)
+        doc = preceding_doc(obj)
+        if doc:
+            put(oline, "doc", doc)
+        body = obj_body(obj)
+        if body is None:
+            return
+        # Object-level Caption/ToolTip and global Labels win over field values.
+        for c in body.children:
+            if c.type == "property":
+                name, val = prop_kv(c)
+                if name and val:
+                    lname = name.lower()
+                    if lname == "caption":
+                        put(oline, "caption", val)
+                    elif lname == "tooltip":
+                        put(oline, "tooltip", val)
+            elif c.type == "var_section":
+                collect_labels(c, oline)
+
+        def rec(n) -> None:
+            for c in n.children:
+                if c.type == "field_declaration":
+                    collect_field(c, oline)
+                elif c.type in ("procedure", "trigger_declaration", "interface_procedure"):
+                    pdoc = preceding_doc(c)
+                    if pdoc:
+                        put(line(c), "doc", pdoc)
+                rec(c)
+
+        rec(body)
+
+    def find_objs(n) -> None:
+        if n.type in _AL_CONFIG.class_types:
+            handle_object(n)
+            return
+        for c in n.children:
+            find_objs(c)
+
+    find_objs(tree.root_node)
+    return out
+
+
 def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
     """Resolve per-file AL facts to edges against the global node set.
 
@@ -4905,7 +5058,24 @@ def extract_al(path: Path) -> dict:
         from tree_sitter import Language, Parser
         parser = Parser(Language(tsal.language()))
         src = path.read_bytes()
-        result["al_facts"] = _al_collect_facts(parser.parse(src), src)
+        tree = parser.parse(src)
+        result["al_facts"] = _al_collect_facts(tree, src)
+        # Additively attach human-facing text (Caption/ToolTip/Label/XML-doc)
+        # onto the object/procedure node sitting on each source line.
+        text_by_line = _al_collect_node_text(tree, src)
+        if text_by_line:
+            for n in result.get("nodes", []):
+                loc = str(n.get("source_location", ""))
+                if loc[:1] != "L":
+                    continue
+                try:
+                    ln = int(loc[1:])
+                except ValueError:
+                    continue
+                attrs = text_by_line.get(ln)
+                if attrs:
+                    for k, v in attrs.items():
+                        n.setdefault(k, v)
     except Exception:
         result.setdefault("al_facts", [])
     return result
