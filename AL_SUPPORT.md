@@ -42,11 +42,12 @@ are `.ProcName()`. `examples/` has a tiny synthetic app you can build and query 
 
 | Relation | Meaning |
 |---|---|
-| `contains` / `method` | file → object (codeunit, table, page, report, query, xmlport, enum, interface, extensions) → its procedures/triggers |
+| `contains` / `method` | file → object (codeunit, table, page, report, query, xmlport, enum, interface, extensions) → its procedures/triggers (a `controladdin`'s `event(...)` declarations are captured here too, as `.OnFoo()` nodes) |
 | `calls` | intra-object procedure calls, type-resolved cross-object Codeunit calls (`MyCdu.DoThing()` resolved via the variable's declared type), indirect dispatch `Codeunit.Run` / `Page.Run(Modal)` / `Report.Run(...)` resolved via the `Object::"Name"` argument, **plus** interface dispatch (`IFoo.Method()` on an `Interface "IFoo"`-typed variable) fanned out to `Method` on every object that `implements "IFoo"` |
 | `subscribes` | `[EventSubscriber]` → the publisher object named in the attribute (objects outside the analyzed corpus become tagged `external` nodes — the integration surface) |
 | `extends` | `tableextension` / `pageextension` / etc. → its base object |
 | `binds` | page `SourceTable`, report/query `dataitem`, xmlport `tableelement` → the table it binds |
+| `usercontrol` | page/pageextension `usercontrol(<ctrl>; <AddIn>)` → the control add-in it embeds; `CurrPage.<ctrl>.<proc>()` calls resolve to that add-in's procedure via the control→add-in map |
 | `relates_to` | a field's `TableRelation` → the foreign-key target table(s) |
 | `computes_from` | a table's FlowField `CalcFormula` (`Sum`/`Count`/`Exist`/`Lookup`/`Average`/`Min`/`Max`) → the source table it aggregates (source field kept on the edge; tables outside the corpus become tagged `external` nodes) |
 | `implements` | object → each interface in its `implements` clause; an enum value's `Implementation = IFace = Impl` also links the concrete impl (`enum_binds_implementation`) and that impl → the interface |
