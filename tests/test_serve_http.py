@@ -198,7 +198,7 @@ def test_session_timeout_zero_disables(tmp_path):
 
 def test_cli_defaults_to_stdio(monkeypatch):
     calls = {}
-    monkeypatch.setattr(serve_mod, "serve", lambda gp: calls.setdefault("stdio", gp))
+    monkeypatch.setattr(serve_mod, "serve", lambda gp, **k: calls.setdefault("stdio", gp))
     monkeypatch.setattr(
         serve_mod, "serve_http", lambda *a, **k: calls.setdefault("http", (a, k))
     )
@@ -209,7 +209,7 @@ def test_cli_defaults_to_stdio(monkeypatch):
 
 def test_cli_http_passes_flags(monkeypatch):
     captured = {}
-    monkeypatch.setattr(serve_mod, "serve", lambda gp: captured.setdefault("stdio", gp))
+    monkeypatch.setattr(serve_mod, "serve", lambda gp, **k: captured.setdefault("stdio", gp))
     monkeypatch.setattr(
         serve_mod, "serve_http", lambda gp, **k: captured.update(gp=gp, **k)
     )
@@ -230,3 +230,27 @@ def test_cli_api_key_from_env(monkeypatch):
     monkeypatch.setattr(serve_mod, "serve_http", lambda gp, **k: captured.update(**k))
     serve_mod._main(["g.json", "--transport", "http"])
     assert captured["api_key"] == "from-env"
+
+
+def test_cli_instructions_from_env(monkeypatch):
+    captured = {}
+    monkeypatch.setenv("GRAPHIFY_INSTRUCTIONS", "custom corpus description")
+    monkeypatch.setattr(serve_mod, "serve_http", lambda gp, **k: captured.update(**k))
+    serve_mod._main(["g.json", "--transport", "http"])
+    assert captured["instructions"] == "custom corpus description"
+
+
+def test_cli_instructions_flag_overrides_env(monkeypatch):
+    captured = {}
+    monkeypatch.setenv("GRAPHIFY_INSTRUCTIONS", "from-env")
+    monkeypatch.setattr(serve_mod, "serve", lambda gp, **k: captured.update(**k))
+    serve_mod._main(["g.json", "--instructions", "from-flag"])
+    assert captured["instructions"] == "from-flag"
+
+
+def test_cli_instructions_unset_by_default(monkeypatch):
+    captured = {}
+    monkeypatch.delenv("GRAPHIFY_INSTRUCTIONS", raising=False)
+    monkeypatch.setattr(serve_mod, "serve", lambda gp, **k: captured.update(**k))
+    serve_mod._main(["g.json"])
+    assert captured["instructions"] is None
