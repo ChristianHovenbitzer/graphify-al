@@ -4726,6 +4726,86 @@ def _al_strip_quotes(s: str) -> str:
     return s
 
 
+# ── stable GLOBAL node identity for cross-graph federation (#27) ──────────────
+# `global_id` is a deterministic join key emitted on EVERY AL node — real objects
+# AND external stubs — so two independently-built graphs can be stitched: a stub
+# for object X in an extending app and the real X node in its own corpus carry the
+# SAME `global_id`. Composed of qualifier (namespace, else app publisher/name from
+# app.json) + object type + normalized object name, so a table and a same-named
+# page never collide and a base-vs-extension app can be disambiguated.
+
+# An *extension object's base has the base's own type; strip the trailing
+# "extension" to recover it (tableextension -> table, pageextension -> page, ...).
+def _al_base_object_type(ext_type: str) -> str:
+    t = (ext_type or "").strip().lower()
+    return t[:-len("extension")] if t.endswith("extension") else t
+
+
+def _al_make_global_id(obj_type: str, name: str, qualifier: str) -> str:
+    """Deterministic cross-graph identity: `al://<qualifier>/<type>/<name>`.
+
+    All three parts are lowercased and the name is unquoted, so the key a stub
+    produces in an extending app equals the key the real object produces in its
+    own corpus. `qualifier` is the AL namespace (or an `app:<publisher>::<name>`
+    fallback, or empty when neither is known) — see `_al_qualifier`.
+    """
+    t = (obj_type or "").strip().lower()
+    n = _al_strip_quotes(name or "").strip().lower()
+    q = (qualifier or "").strip().lower()
+    return f"al://{q}/{t}/{n}"
+
+
+# app.json publisher/name is a coarse per-app fallback qualifier used only when a
+# file declares no namespace. It is cached per directory tree so the lookup does
+# not re-stat the filesystem for every AL file in an app.
+_AL_APP_QUALIFIER_CACHE: dict[str, str] = {}
+
+
+def _al_qualifier(path: Path, namespace: str) -> str:
+    """Best-available federation qualifier for an object declared in `path`.
+
+    Prefers the AL `namespace` (namespaces are app-independent, so a base object
+    and a reference to it from another app share it — the property that makes the
+    federation join deterministic). Falls back to `app:<publisher>::<name>` from
+    the nearest `app.json` when there is no namespace, else "".
+    """
+    ns = (namespace or "").strip()
+    if ns:
+        return ns
+    try:
+        start = str(Path(path).resolve().parent)
+    except Exception:
+        return ""
+    if start in _AL_APP_QUALIFIER_CACHE:
+        return _AL_APP_QUALIFIER_CACHE[start]
+    qual = ""
+    try:
+        cur = Path(start)
+        for _ in range(8):
+            appjson = cur / "app.json"
+            if appjson.is_file():
+                try:
+                    data = json.loads(appjson.read_text(encoding="utf-8-sig"))
+                except Exception:
+                    data = None
+                # Only a BC AL manifest counts — it always carries `publisher`.
+                # This skips unrelated app.json files (Azure/tooling configs) that
+                # happen to sit in a parent directory.
+                if isinstance(data, dict) and "publisher" in data:
+                    pub = str(data.get("publisher", "")).strip()
+                    nm = str(data.get("name", "")).strip()
+                    if pub or nm:
+                        qual = f"app:{pub}::{nm}"
+                    break
+            if cur.parent == cur:
+                break
+            cur = cur.parent
+    except Exception:
+        qual = ""
+    _AL_APP_QUALIFIER_CACHE[start] = qual
+    return qual
+
+
 def _al_type_object(type_text: str):
     """('codeunit', 'LSE Foo') for an object-typed `type_specification`, else None."""
     m = _AL_OBJ_TYPE_RE.match(type_text)
@@ -5070,6 +5150,46 @@ def _al_parse_doc(comments: list[str]) -> str:
     return " ".join(inner.split())
 
 
+def _al_collect_object_identity(tree, source: bytes):
+    """(file_namespace, {decl_line: (object_type, object_name)}) for #27 global ids.
+
+    `object_type` is the declaration kind (table/page/codeunit/tableextension/...);
+    `object_name` is the declared (unquoted) name. Keyed by the object's
+    declaration line so it can be matched onto the graph node on that line.
+    """
+    def text(n) -> str:
+        return source[n.start_byte:n.end_byte].decode("utf-8", "replace")
+
+    namespace = ""
+    for c in tree.root_node.children:
+        if c.type == "namespace_declaration":
+            for cc in c.children:
+                if cc.type == "namespace_name":
+                    namespace = text(cc).strip()
+                    break
+            break
+
+    by_line: dict[int, tuple] = {}
+
+    def find_objs(n) -> None:
+        if n.type in _AL_CONFIG.class_types:
+            name_node = n.child_by_field_name(_AL_CONFIG.name_field)
+            if name_node is None:
+                for child in n.children:
+                    if child.type in _AL_CONFIG.name_fallback_child_types:
+                        name_node = child
+                        break
+            if name_node is not None:
+                obj_type = n.type[:-len("_declaration")] if n.type.endswith("_declaration") else n.type
+                by_line.setdefault(n.start_point[0] + 1, (obj_type, _al_strip_quotes(text(name_node))))
+            return
+        for c in n.children:
+            find_objs(c)
+
+    find_objs(tree.root_node)
+    return namespace, by_line
+
+
 def _al_collect_node_text(tree, source: bytes) -> dict[int, dict]:
     """Map a source line -> human-facing text attributes for the node on it.
 
@@ -5236,19 +5356,45 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
                 proc_by_objmeth.setdefault((oid, meth), nid)
                 break
 
+    # #27: object node lookup so an `extends` stub can inherit the base's type
+    # from the extending object's declaration kind (tableextension -> table, ...).
+    objnode_by_id: dict[str, dict] = {n["id"]: n for n in objnodes}
+
     new_nodes: list[dict] = []
     ext_cache: dict[str, str] = {}
 
-    def ensure_external(label: str) -> str:
+    def ensure_external(label: str, qualifier: str = "", obj_type: str = "") -> str:
+        # Existing dedup is by name (BC object names are globally unique), so the
+        # same external object referenced via different facts collapses to one
+        # stub. #27: stamp a `global_id` on the stub keyed the same way a real
+        # node keys itself, so a federation resolver can join the two graphs.
+        # The first reference to name it wins the (type, qualifier) — later refs
+        # reuse the cached stub unchanged.
         key = label.lower()
         if key in ext_cache:
             return ext_cache[key]
         nid = "al_ext_" + _make_id(label)
-        new_nodes.append({"label": label, "file_type": "external",
-                          "source_file": "", "source_location": "L1",
-                          "_origin": "al_external", "id": nid})
+        stub = {"label": label, "file_type": "external",
+                "source_file": "", "source_location": "L1",
+                "_origin": "al_external", "id": nid,
+                "global_id": _al_make_global_id(obj_type, label, qualifier)}
+        if obj_type:
+            stub["al_object_type"] = obj_type
+        if qualifier:
+            stub["al_namespace"] = qualifier
+        new_nodes.append(stub)
         ext_cache[key] = nid
         return nid
+
+    # #27: object type a stub target should carry, inferred from how it is
+    # referenced. `extends` is handled separately (needs the source object's
+    # kind); kinds absent here (calls/subscribes/uses) leave the stub type empty
+    # because the referenced object's kind is not knowable from the reference.
+    _STUB_TYPE_BY_KIND = {
+        "relates_to": "table", "computes_from": "table", "transfers_to": "table",
+        "binds": "table", "implements": "interface",
+        "enum_binds_implementation": "codeunit",
+    }
 
     _REL = {"extends": "extends", "subscribes": "subscribes",
             "calls": "calls", "uses": "references", "binds": "binds",
@@ -5297,6 +5443,10 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
         if not facts:
             continue
         nodes = result.get("nodes", [])
+        # #27: qualifier of THIS file's objects; a stub keeps the referencing
+        # file's qualifier (best-effort — the target's true home namespace needs
+        # the dependency's symbols and is a serve-layer concern).
+        src_qualifier = result.get("al_qualifier", "")
         line2nid: dict[int, str] = {}
         line2node: dict[int, dict] = {}
         file_line: dict[int, str] = {}
@@ -5356,7 +5506,7 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
                 # source resolved by object name (e.g. an enum-bound impl codeunit
                 # that may live in another file) rather than by line in this file.
                 src = (obj_by_name.get(_al_strip_quotes(src_name).lower())
-                       or ensure_external(src_name))
+                       or ensure_external(src_name, src_qualifier))
             elif f["kind"] == "binds":
                 # `binds` attributes to the object's declaration line but is
                 # defined to originate from that object's FILE node, whereas the
@@ -5377,10 +5527,17 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
                 # external stub when the base lives outside the corpus.
                 # Without this, the `src == tgt` guard below silently dropped
                 # nearly every extends edge (#10).
+                # The base object's type is the extension's own kind minus the
+                # trailing "extension" (tableextension -> table); a stub for the
+                # out-of-corpus base carries that so it matches the real base node.
+                src_node = line2node.get(f.get("src_line"))
+                base_type = _al_base_object_type(
+                    (src_node or {}).get("al_object_type", "")) if src_node else ""
                 tgt = next((i for i in obj_ids_by_name.get(key, []) if i != src), None) \
-                    or ensure_external(tname)
+                    or ensure_external(tname, src_qualifier, base_type)
             else:
-                tgt = obj_by_name.get(key) or ensure_external(tname)
+                tgt = obj_by_name.get(key) or ensure_external(
+                    tname, src_qualifier, _STUB_TYPE_BY_KIND.get(f["kind"], ""))
                 if f["kind"] == "calls":
                     tgt = proc_by_objmeth.get((tgt, str(f.get("method", "")).lower()), tgt)
                 elif f["kind"] == "subscribes":
@@ -5423,6 +5580,34 @@ def extract_al(path: Path) -> dict:
         src = path.read_bytes()
         tree = parser.parse(src)
         result["al_facts"] = _al_collect_facts(tree, src)
+        # #27: stable global identity. Compute the file namespace + per-object
+        # (type, name), derive the federation qualifier (namespace, else app.json
+        # fallback), and stamp `global_id` (plus `al_object_type`/`al_namespace`)
+        # onto each real object node. The qualifier is also threaded out on the
+        # result so cross-file stub resolution can key stubs the same way.
+        namespace, ident_by_line = _al_collect_object_identity(tree, src)
+        qualifier = _al_qualifier(path, namespace)
+        result["al_namespace"] = namespace
+        result["al_qualifier"] = qualifier
+        for n in result.get("nodes", []):
+            lbl = str(n.get("label", ""))
+            if lbl.endswith(".al") or lbl.startswith("."):
+                continue  # file node / procedure/member node — not an object
+            loc = str(n.get("source_location", ""))
+            if loc[:1] != "L":
+                continue
+            try:
+                ln = int(loc[1:])
+            except ValueError:
+                continue
+            ident = ident_by_line.get(ln)
+            if not ident:
+                continue
+            obj_type, obj_name = ident
+            n.setdefault("al_object_type", obj_type)
+            if namespace:
+                n.setdefault("al_namespace", namespace)
+            n.setdefault("global_id", _al_make_global_id(obj_type, obj_name, qualifier))
         # Additively attach human-facing text (Caption/ToolTip/Label/XML-doc)
         # onto the object/procedure node sitting on each source line.
         text_by_line = _al_collect_node_text(tree, src)
