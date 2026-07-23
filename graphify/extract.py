@@ -4750,6 +4750,33 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
         for c in node.children:
             walk_calls(c, proc_line, varmap)
 
+    def collect_bindings(node, obj_line: int) -> None:
+        # Object→table data bindings: page `SourceTable`, report/query `dataitem`,
+        # xmlport `tableelement`. Attributed to the object's declaration line so
+        # they resolve to the object node (like `extends`).
+        t = node.type
+        if t == "property":
+            nm = node.child_by_field_name("name")
+            val = node.child_by_field_name("value")
+            if (nm is not None and val is not None
+                    and text(nm).strip().lower() == "sourcetable"):
+                facts.append({"kind": "binds", "src_line": obj_line,
+                              "target": _al_strip_quotes(text(val))})
+        elif t in ("report_dataitem", "query_dataitem"):
+            tn = node.child_by_field_name("table_name")
+            if tn is not None:
+                facts.append({"kind": "binds", "src_line": obj_line,
+                              "target": _al_strip_quotes(text(tn))})
+        elif t == "xmlport_element":
+            # The element keyword (tableelement/textelement/fieldelement) is not a
+            # named child; only `tableelement` binds a table via its `source` field.
+            src_node = node.child_by_field_name("source")
+            if src_node is not None and text(node).split("(", 1)[0].strip().lower() == "tableelement":
+                facts.append({"kind": "binds", "src_line": obj_line,
+                              "target": _al_strip_quotes(text(src_node))})
+        for c in node.children:
+            collect_bindings(c, obj_line)
+
     def walk_obj(obj) -> None:
         obj_line = line(obj)
         base = obj.child_by_field_name("base_object")
@@ -4759,6 +4786,7 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
         body = obj.child_by_field_name("body")
         if body is None:
             return
+        collect_bindings(body, obj_line)
         obj_vars: dict = {}
         for c in body.children:
             if c.type == "var_section":
@@ -4847,7 +4875,7 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
         return nid
 
     _REL = {"extends": "extends", "subscribes": "subscribes",
-            "calls": "calls", "uses": "references"}
+            "calls": "calls", "uses": "references", "binds": "binds"}
     new_edges: list[dict] = []
     seen: set = set()
     for result in per_file:
@@ -4885,7 +4913,7 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
             new_edges.append({
                 "source": src, "target": tgt, "relation": rel,
                 "context": "al_" + f["kind"],
-                "confidence": "EXTRACTED" if f["kind"] in ("extends", "subscribes") else "INFERRED",
+                "confidence": "EXTRACTED" if f["kind"] in ("extends", "subscribes", "binds") else "INFERRED",
                 "confidence_score": 0.9, "source_file": sf,
                 "source_location": f"L{f.get('src_line', '')}", "weight": 1.0,
             })
