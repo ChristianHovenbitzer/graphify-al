@@ -5187,6 +5187,31 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
         for c in node.children:
             collect_modify_field_validate(c, base_name)
 
+    def collect_permissions(node, obj_line: int) -> None:
+        # A permissionset/permissionsetextension `Permissions` property grants a
+        # mask (RIMD / X / ...) on each listed object. The grammar wraps every
+        # grant in a `tabledata_permission` node whose leading token names the
+        # object kind (tabledata/table/page/report/codeunit/query/xmlport/system);
+        # tabledata and system carry no explicit `*_keyword` child, so the kind is
+        # read from the node's first token. Emit one `grants` fact per object,
+        # attributed to the permissionset's declaration line, carrying the mask and
+        # object kind as attributes so the security surface is traceable (#31).
+        if node.type == "tabledata_permission":
+            name_node = next((c for c in node.children
+                              if c.type in ("identifier", "quoted_identifier")), None)
+            mask_node = next((c for c in node.children
+                              if c.type == "permission_type"), None)
+            if name_node is not None:
+                head = text(node).strip().split(None, 1)
+                kind = head[0].lower() if head else ""
+                facts.append({"kind": "grants", "src_line": obj_line,
+                              "target": _al_strip_quotes(text(name_node)),
+                              "mask": text(mask_node).upper() if mask_node is not None else "",
+                              "obj_kind": kind})
+            return
+        for c in node.children:
+            collect_permissions(c, obj_line)
+
     def walk_calc_formulas(node, obj_line: int) -> None:
         # FlowField CalcFormula (sum/count/exist/average/min/max -> aggregate_formula,
         # lookup -> lookup_formula) each carry a `calc_field_reference` naming the
@@ -5212,6 +5237,8 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                           "target": _al_strip_quotes(text(base))})
         if obj.type in ("table_declaration", "tableextension_declaration"):
             collect_table_relations(obj, obj_line)
+        if obj.type in ("permissionset_declaration", "permissionsetextension_declaration"):
+            collect_permissions(obj, obj_line)
         if obj.type == "tableextension_declaration" and base is not None:
             # `modify(<Field>) { trigger OnValidate() }` extends a field that lives
             # in the BASE table (a different object). Emit a fact linking the
@@ -5587,15 +5614,24 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
         "enum_binds_implementation": "codeunit",
     }
 
+    # A permissionset grant's object kind maps to the target object's node type,
+    # used to type an out-of-corpus stub (#31). `tabledata` grants a table; `system`
+    # objects (menu suites/debugger/etc.) have no object node kind, so left blank.
+    _AL_PERM_STUB_TYPE = {
+        "tabledata": "table", "table": "table", "page": "page",
+        "report": "report", "codeunit": "codeunit", "query": "query",
+        "xmlport": "xmlport", "system": "",
+    }
+
     _REL = {"extends": "extends", "subscribes": "subscribes",
             "calls": "calls", "uses": "references", "binds": "binds",
             "relates_to": "relates_to", "computes_from": "computes_from",
             "implements": "implements",
             "enum_binds_implementation": "enum_binds_implementation",
-            "transfers_to": "transfers_to"}
+            "transfers_to": "transfers_to", "grants": "grants"}
     _EXTRACTED = frozenset({"extends", "subscribes", "binds", "relates_to",
                             "computes_from", "implements",
-                            "enum_binds_implementation", "transfers_to"})
+                            "enum_binds_implementation", "transfers_to", "grants"})
 
     # Interface dispatch fans a call on an `Interface "IFoo"`-typed variable out to
     # every object that `implements "IFoo"`. Pre-index implementor node ids by
@@ -5746,8 +5782,11 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
                 tgt = next((i for i in obj_ids_by_name.get(key, []) if i != src), None) \
                     or ensure_external(tname, src_qualifier, base_type)
             else:
+                stub_type = _STUB_TYPE_BY_KIND.get(f["kind"], "")
+                if f["kind"] == "grants":
+                    stub_type = _AL_PERM_STUB_TYPE.get(f.get("obj_kind", ""), "")
                 tgt = obj_by_name.get(key) or ensure_external(
-                    tname, src_qualifier, _STUB_TYPE_BY_KIND.get(f["kind"], ""))
+                    tname, src_qualifier, stub_type)
                 if f["kind"] == "calls":
                     tgt = proc_by_objmeth.get((tgt, str(f.get("method", "")).lower()), tgt)
                 elif f["kind"] == "subscribes":
@@ -5776,6 +5815,9 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
             }
             if f["kind"] == "computes_from" and f.get("field"):
                 edge["member"] = f["field"]  # source field (fields are not graph nodes)
+            if f["kind"] == "grants":
+                edge["mask"] = f.get("mask", "")  # permission mask (RIMD / X / ...)
+                edge["al_object_kind"] = f.get("obj_kind", "")
             new_edges.append(edge)
     all_nodes.extend(new_nodes)
     return new_edges
