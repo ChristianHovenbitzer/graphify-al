@@ -5461,6 +5461,72 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
         for c in node.children:
             collect_columns(c, current_table)
 
+    def _al_page_source_table(body) -> str | None:
+        # A page's `SourceTable` names the table its `field(...)` RunPageLink
+        # references resolve against; pageextensions carry none (their base does).
+        for c in body.children:
+            if c.type != "property":
+                continue
+            nm = c.child_by_field_name("name")
+            val = c.child_by_field_name("value")
+            if (nm is not None and val is not None
+                    and text(nm).strip().lower() == "sourcetable"):
+                return _al_strip_quotes(text(val))
+        return None
+
+    def collect_page_actions(node, source_table) -> None:
+        # Page/pageextension `action(...)` navigation. RunObject names the object
+        # the action opens (navigates_to -> the target page/report/...); each
+        # RunPageLink `"Target Fld" = field("Src Fld")` pairing ties the action
+        # to the source page's own SourceTable field it filters by (links_field ->
+        # that field's node). Facts are attributed to the action_declaration's line
+        # so they land on the object+member-qualified action node (#28).
+        if node.type == "action_declaration":
+            act_line = line(node)
+            decl = next((c for c in node.children
+                         if c.type == "declaration_body"), None)
+            if decl is not None:
+                for prop in decl.children:
+                    if prop.type != "property":
+                        continue
+                    pname = prop.child_by_field_name("name")
+                    if pname is None:
+                        pname = next((c for c in prop.children
+                                      if c.type == "property_name"), None)
+                    if pname is None:
+                        continue
+                    pn = text(pname).strip().lower()
+                    if pn == "runobject":
+                        orv = next((c for c in prop.children
+                                    if c.type == "object_reference_value"), None)
+                        if orv is not None:
+                            kw = next((c for c in orv.children
+                                       if c.type.endswith("_keyword")), None)
+                            nm = next((c for c in orv.children
+                                       if c.type in ("quoted_identifier", "identifier")), None)
+                            if nm is not None:
+                                facts.append({
+                                    "kind": "navigates_to", "src_line": act_line,
+                                    "target": _al_strip_quotes(text(nm)),
+                                    "target_kind": (text(kw).strip().lower()
+                                                    if kw is not None else "")})
+                    elif pn == "runpagelink" and source_table:
+                        # `"Target Fld" = field("Src Fld")` links a source field;
+                        # `= const(X)` / `= filter(X)` are literals, not fields. A
+                        # single pair parses as a `comparison_expression` while
+                        # multiple pairs parse as elided `link_value`s, so match the
+                        # `field(...)` reference over the property text uniformly.
+                        for m in re.finditer(
+                                r'field\s*\(\s*("[^"]*"|[A-Za-z_][A-Za-z0-9_]*)\s*\)',
+                                text(prop), re.IGNORECASE):
+                            srcfld = _al_strip_quotes(m.group(1))
+                            if srcfld:
+                                facts.append({
+                                    "kind": "links_field", "src_line": act_line,
+                                    "target": source_table, "field": srcfld})
+        for c in node.children:
+            collect_page_actions(c, source_table)
+
     def walk_obj(obj) -> None:
         obj_line = line(obj)
         if obj.type in ("report_declaration", "query_declaration"):
@@ -5495,6 +5561,8 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
         if body is None:
             return
         collect_bindings(body, obj_line)
+        if obj.type in ("page_declaration", "pageextension_declaration"):
+            collect_page_actions(body, _al_page_source_table(body))
         # enum value `Implementation = IFace = Impl` bindings: the enum binds the
         # concrete impl (enum_binds_implementation) and that impl implements IFace.
         for c in body.children:
@@ -6019,11 +6087,12 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
             "implements": "implements",
             "enum_binds_implementation": "enum_binds_implementation",
             "transfers_to": "transfers_to", "typed_as": "typed_as",
-            "grants": "grants", "sub_page": "subpage"}
+            "grants": "grants", "sub_page": "subpage",
+            "navigates_to": "navigates_to"}
     _EXTRACTED = frozenset({"extends", "subscribes", "binds", "relates_to",
                             "computes_from", "implements",
                             "enum_binds_implementation", "transfers_to",
-                            "typed_as", "grants", "sub_page"})
+                            "typed_as", "grants", "sub_page", "navigates_to"})
 
     # Interface dispatch fans a call on an `Interface "IFoo"`-typed variable out to
     # every object that `implements "IFoo"`. Pre-index implementor node ids by
@@ -6156,6 +6225,26 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
                                 "source_location": f"L{f.get('src_line', '')}", "weight": 1.0,
                             })
                 continue
+            if f["kind"] == "links_field":
+                # page `action` RunPageLink `= field("Src")`: link the action
+                # member node (this file, by line) to the source page's own
+                # SourceTable field it filters by (#28).
+                src = line2nid.get(f.get("src_line"))
+                tname = f.get("target")
+                fld = f.get("field")
+                if src and tname and fld:
+                    tgt = resolve_field(tname, fld)
+                    if src != tgt:
+                        pair = (src, tgt, "links_field")
+                        if pair not in seen:
+                            seen.add(pair)
+                            new_edges.append({
+                                "source": src, "target": tgt, "relation": "links_field",
+                                "context": "al_links_field", "confidence": "EXTRACTED",
+                                "confidence_score": 0.9, "source_file": sf,
+                                "source_location": f"L{f.get('src_line', '')}", "weight": 1.0,
+                            })
+                continue
             tname = f.get("target")
             if not tname:
                 continue
@@ -6197,6 +6286,9 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
                 stub_type = _STUB_TYPE_BY_KIND.get(f["kind"], "")
                 if f["kind"] == "grants":
                     stub_type = _AL_PERM_STUB_TYPE.get(f.get("obj_kind", ""), "")
+                if f.get("target_kind"):
+                    # navigates_to RunObject keyword (page/report/...) types the stub (#28).
+                    stub_type = f.get("target_kind")
                 tgt = obj_by_name.get(key) or ensure_external(
                     tname, src_qualifier, stub_type)
                 if f["kind"] == "calls":
