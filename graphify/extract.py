@@ -4658,9 +4658,10 @@ def extract_php(path: Path) -> dict:
 # ── AL semantic layer ─────────────────────────────────────────────────────────
 # The generic extractor gives objects, procedures and intra-object calls, but AL's
 # real cross-object wiring is invisible to it: calls go through typed variables
-# (`MyCdu.DoThing()`), events bind by attribute, and extensions name a base object.
-# These three facts are collected per file here, then resolved against the global
-# node set in `_resolve_al_facts` (called from extract()).
+# (`MyCdu.DoThing()`), events bind by attribute, extensions name a base object, and
+# a field's `TableRelation` names a foreign-key target table. These facts are
+# collected per file here, then resolved against the global node set in
+# `_resolve_al_facts` (called from extract()).
 #
 # `uses` (Record/Page/Report data dependencies) is high-volume and tends to bury
 # the call graph under a table-sharing hairball, so it is OFF unless
@@ -4750,12 +4751,53 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
         for c in node.children:
             walk_calls(c, proc_line, varmap)
 
+    def collect_table_relations(node, obj_line: int) -> None:
+        # A field's `TableRelation` property names the target table(s). Targets are
+        # emitted from the table/tableextension node (fields are not own graph nodes).
+        # Simple forms (`= Table` / `= "Table"` / `= Table."Field"`) and conditional
+        # `if (...) A else B` forms both surface each target as a
+        # `simple_table_relation`; the trivial bare form has no such wrapper, so the
+        # target is the property value token itself.
+        if node.type == "property":
+            pname = next((c for c in node.children if c.type == "property_name"), None)
+            if pname is not None and text(pname).strip().lower() == "tablerelation":
+                strels: list = []
+
+                def find_strel(n) -> None:
+                    if n.type == "simple_table_relation":
+                        strels.append(n)
+                    for c in n.children:
+                        find_strel(c)
+
+                find_strel(node)
+                targets: list[str] = []
+                if strels:
+                    for s in strels:
+                        head = next((c for c in s.children
+                                     if c.type in ("identifier", "quoted_identifier")), None)
+                        if head is not None:
+                            targets.append(_al_strip_quotes(text(head)))
+                else:
+                    head = next((c for c in node.children
+                                 if c.type in ("identifier", "quoted_identifier")), None)
+                    if head is not None:
+                        targets.append(_al_strip_quotes(text(head)))
+                for tname in targets:
+                    if tname:
+                        facts.append({"kind": "relates_to", "src_line": obj_line,
+                                      "target": tname})
+                return
+        for c in node.children:
+            collect_table_relations(c, obj_line)
+
     def walk_obj(obj) -> None:
         obj_line = line(obj)
         base = obj.child_by_field_name("base_object")
         if base is not None:
             facts.append({"kind": "extends", "src_line": obj_line,
                           "target": _al_strip_quotes(text(base))})
+        if obj.type in ("table_declaration", "tableextension_declaration"):
+            collect_table_relations(obj, obj_line)
         body = obj.child_by_field_name("body")
         if body is None:
             return
@@ -4847,7 +4889,7 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
         return nid
 
     _REL = {"extends": "extends", "subscribes": "subscribes",
-            "calls": "calls", "uses": "references"}
+            "calls": "calls", "uses": "references", "relates_to": "relates_to"}
     new_edges: list[dict] = []
     seen: set = set()
     for result in per_file:
@@ -4885,7 +4927,7 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
             new_edges.append({
                 "source": src, "target": tgt, "relation": rel,
                 "context": "al_" + f["kind"],
-                "confidence": "EXTRACTED" if f["kind"] in ("extends", "subscribes") else "INFERRED",
+                "confidence": "EXTRACTED" if f["kind"] in ("extends", "subscribes", "relates_to") else "INFERRED",
                 "confidence_score": 0.9, "source_file": sf,
                 "source_location": f"L{f.get('src_line', '')}", "weight": 1.0,
             })
@@ -4898,7 +4940,8 @@ def extract_al(path: Path) -> dict:
     namespace imports, and procedure calls from a .al file (Business Central).
 
     Also collects AL-specific facts (typed cross-object calls, event subscriptions,
-    extension targets) into result["al_facts"] for cross-file resolution in extract()."""
+    extension targets, field TableRelation foreign keys) into result["al_facts"] for
+    cross-file resolution in extract()."""
     result = _extract_generic(path, _AL_CONFIG)
     try:
         import tree_sitter_al as tsal
@@ -13155,8 +13198,9 @@ def extract(
             import logging
             logging.getLogger(__name__).warning("Java type-reference resolution failed, skipping: %s", exc)
 
-    # Cross-file AL resolution: typed Codeunit calls, event subscriptions, and
-    # extension targets — the cross-object wiring the generic extractor can't see.
+    # Cross-file AL resolution: typed Codeunit calls, event subscriptions,
+    # extension targets, and field TableRelation foreign keys — the cross-object
+    # wiring the generic extractor can't see.
     if any(p.suffix == ".al" for p in paths):
         try:
             all_edges.extend(_resolve_al_facts(per_file, all_nodes))
