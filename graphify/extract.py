@@ -4811,13 +4811,16 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
     al_nodes = [n for n in all_nodes
                 if str(n.get("source_file", "")).lower().endswith(".al")]
     obj_by_name: dict[str, str] = {}
+    obj_ids_by_name: dict[str, list[str]] = {}
     objnodes: list[dict] = []
     for n in al_nodes:
         lbl = n.get("label", "")
         if lbl.endswith(".al") or lbl.startswith("."):
             continue  # file node / procedure node
         objnodes.append(n)
-        obj_by_name.setdefault(_al_strip_quotes(lbl).lower(), n["id"])
+        key = _al_strip_quotes(lbl).lower()
+        obj_by_name.setdefault(key, n["id"])
+        obj_ids_by_name.setdefault(key, []).append(n["id"])
 
     objids = sorted((n["id"] for n in objnodes), key=len, reverse=True)
     proc_by_objmeth: dict[tuple, str] = {}
@@ -4872,9 +4875,22 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
             tname = f.get("target")
             if not src or not tname:
                 continue
-            tgt = obj_by_name.get(_al_strip_quotes(tname).lower()) or ensure_external(tname)
-            if f["kind"] == "calls":
-                tgt = proc_by_objmeth.get((tgt, str(f.get("method", "")).lower()), tgt)
+            key = _al_strip_quotes(tname).lower()
+            if f["kind"] == "extends":
+                # An *extension object shares its base's identifier (e.g.
+                # `tableextension 50100 Customer extends Customer`), so plain
+                # name resolution can land back on the extension's own node.
+                # The base is a distinct node (different file stem -> different
+                # id); pick a same-named node other than this one, or an
+                # external stub when the base lives outside the corpus.
+                # Without this, the `src == tgt` guard below silently dropped
+                # nearly every extends edge (#10).
+                tgt = next((i for i in obj_ids_by_name.get(key, []) if i != src), None) \
+                    or ensure_external(tname)
+            else:
+                tgt = obj_by_name.get(key) or ensure_external(tname)
+                if f["kind"] == "calls":
+                    tgt = proc_by_objmeth.get((tgt, str(f.get("method", "")).lower()), tgt)
             if src == tgt:
                 continue
             rel = _REL[f["kind"]]
