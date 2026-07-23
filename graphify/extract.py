@@ -3112,6 +3112,99 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
 
                 _al_collect_members(node, class_nid, [0])
 
+                # #37: table/tableextension keys are not object members (no
+                # trigger, no caption, no nesting) so they live outside
+                # _AL_MEMBER_TYPES, but they ARE first-class table children the
+                # graph should show. Emit one node per `key(Name; Field, ...)`
+                # parented to the table, carrying the ordered key fields and any
+                # SumIndexFields (the SIFT columns FlowFields sum over) as node
+                # attributes. Keyed under the table but namespaced with a `key `
+                # segment so a key and a same-named field never collide.
+                used_key_ids: set[str] = set()
+
+                def _al_field_names(field_list_node) -> list[str]:
+                    return [
+                        _read_text(c, source)
+                        for c in field_list_node.children
+                        if c.type in ("identifier", "quoted_identifier")
+                    ]
+
+                def _al_key_idents(prop_value_root) -> list[str]:
+                    # SumIndexFields is either a single identifier or an
+                    # option_member_list of identifiers/quoted_identifiers; walk
+                    # descendants so both shapes collapse to a flat name list.
+                    out: list[str] = []
+
+                    def rec(n):
+                        for c in n.children:
+                            if c.type in ("identifier", "quoted_identifier"):
+                                out.append(_read_text(c, source))
+                            else:
+                                rec(c)
+
+                    rec(prop_value_root)
+                    return out
+
+                def _al_collect_keys(n, seq):
+                    if n.type == "key_declaration":
+                        seq[0] += 1
+                        k_line = n.start_point[0] + 1
+                        key_name = None
+                        key_fields: list[str] = []
+                        sif: list[str] = []
+                        clustered = False
+                        for c in n.children:
+                            if (key_name is None
+                                    and c.type in ("identifier", "quoted_identifier")):
+                                key_name = _read_text(c, source)
+                            elif c.type == "field_list":
+                                key_fields = _al_field_names(c)
+                            elif c.type == "declaration_body":
+                                for p in c.children:
+                                    if p.type != "property":
+                                        continue
+                                    pname = None
+                                    for pc in p.children:
+                                        if pc.type == "property_name":
+                                            pname = _read_text(pc, source).lower()
+                                            break
+                                    if pname == "sumindexfields":
+                                        sif = _al_key_idents(p)
+                                    elif pname == "clustered":
+                                        clustered = any(
+                                            pc.type == "boolean"
+                                            and _read_text(pc, source).lower() == "true"
+                                            for pc in p.children
+                                        )
+                        k_nid, _syn = _al_member_id(
+                            class_nid,
+                            f"key {key_name}" if key_name else None,
+                            seq[0], used_key_ids)
+                        label = f".key({key_name})" if key_name else f".key{seq[0]}"
+                        if k_nid not in seen_ids:
+                            seen_ids.add(k_nid)
+                            knode = {
+                                "id": k_nid,
+                                "label": label,
+                                "file_type": "code",
+                                "source_file": str_path,
+                                "source_location": f"L{k_line}",
+                                "al_member_kind": "key",
+                            }
+                            if key_fields:
+                                knode["key_fields"] = key_fields
+                            if sif:
+                                knode["sumindexfields"] = sif
+                            if clustered:
+                                knode["clustered"] = True
+                            nodes.append(knode)
+                        add_edge(class_nid, k_nid, "contains", k_line)
+                        return
+                    for c in n.children:
+                        _al_collect_keys(c, seq)
+
+                _al_collect_keys(node, [0])
+
             # Find body and recurse
             body = _find_body(node, config)
             if body:
