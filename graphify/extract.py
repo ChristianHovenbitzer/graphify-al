@@ -2294,6 +2294,7 @@ _AL_MEMBER_TYPES = frozenset({
     "enum_value_declaration",   # enum / enumextension value
     "page_field",               # page / pageextension control
     "action_declaration",       # page / pageextension action
+    "part_section",             # page / pageextension part (subpage / factbox)
     "report_dataitem",          # report dataitem (may nest)
     "query_dataitem",           # query dataitem (may nest)
     "xmlport_element",          # xmlport text/table/field element (may nest)
@@ -5125,6 +5126,44 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
         for c in node.children:
             collect_bindings(c, obj_line)
 
+    def collect_page_parts(node) -> None:
+        # A page/pageextension `part(<Name>; <TargetPage>) { SubPageLink = ... }`
+        # composes a subpage/factbox: an edge from the part member (host page) to
+        # the target page, tagged with the SubPageLink linkage when present.
+        # Attributed to the part_section's line so it lands on the part member node.
+        if node.type == "part_section":
+            names = [c for c in node.children
+                     if c.type in ("identifier", "quoted_identifier")]
+            # children order is [part name, target page]; the target is the second.
+            if len(names) >= 2:
+                target = _al_strip_quotes(text(names[1]))
+                if target:
+                    link = ""
+                    body = node.child_by_field_name("body")
+                    scan = body.children if body is not None else node.children
+                    for prop in scan:
+                        if prop.type != "property":
+                            continue
+                        pname = next((c for c in prop.children
+                                      if c.type == "property_name"), None)
+                        if pname is not None and text(pname).strip().lower() == "subpagelink":
+                            val = prop.child_by_field_name("value")
+                            if val is None:
+                                val = next((c for c in prop.children
+                                            if c.type in ("property_expression",)), None)
+                            if val is not None:
+                                link = " ".join(text(val).split())
+                            break
+                    fact = {"kind": "sub_page", "src_line": line(node),
+                            "target": target}
+                    if link:
+                        fact["sub_page_link"] = link
+                    facts.append(fact)
+            # parts don't nest a further part; no recursion needed past here.
+            return
+        for c in node.children:
+            collect_page_parts(c)
+
     def collect_table_relations(node, obj_line: int) -> None:
         # A field's `TableRelation` property names the target table(s). Targets are
         # emitted from the table/tableextension node (fields are not own graph nodes).
@@ -5212,6 +5251,8 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                           "target": _al_strip_quotes(text(base))})
         if obj.type in ("table_declaration", "tableextension_declaration"):
             collect_table_relations(obj, obj_line)
+        if obj.type in ("page_declaration", "pageextension_declaration"):
+            collect_page_parts(obj)
         if obj.type == "tableextension_declaration" and base is not None:
             # `modify(<Field>) { trigger OnValidate() }` extends a field that lives
             # in the BASE table (a different object). Emit a fact linking the
@@ -5584,7 +5625,7 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
     _STUB_TYPE_BY_KIND = {
         "relates_to": "table", "computes_from": "table", "transfers_to": "table",
         "binds": "table", "implements": "interface",
-        "enum_binds_implementation": "codeunit",
+        "enum_binds_implementation": "codeunit", "sub_page": "page",
     }
 
     _REL = {"extends": "extends", "subscribes": "subscribes",
@@ -5592,10 +5633,11 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
             "relates_to": "relates_to", "computes_from": "computes_from",
             "implements": "implements",
             "enum_binds_implementation": "enum_binds_implementation",
-            "transfers_to": "transfers_to"}
+            "transfers_to": "transfers_to", "sub_page": "subpage"}
     _EXTRACTED = frozenset({"extends", "subscribes", "binds", "relates_to",
                             "computes_from", "implements",
-                            "enum_binds_implementation", "transfers_to"})
+                            "enum_binds_implementation", "transfers_to",
+                            "sub_page"})
 
     # Interface dispatch fans a call on an `Interface "IFoo"`-typed variable out to
     # every object that `implements "IFoo"`. Pre-index implementor node ids by
@@ -5776,6 +5818,8 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
             }
             if f["kind"] == "computes_from" and f.get("field"):
                 edge["member"] = f["field"]  # source field (fields are not graph nodes)
+            if f["kind"] == "sub_page" and f.get("sub_page_link"):
+                edge["sub_page_link"] = f["sub_page_link"]  # SubPageLink linkage
             new_edges.append(edge)
     all_nodes.extend(new_nodes)
     return new_edges
