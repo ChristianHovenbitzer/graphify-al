@@ -5500,6 +5500,158 @@ def _al_collect_node_text(tree, source: bytes) -> dict[int, dict]:
     return out
 
 
+# AL object properties worth exposing as node attributes (#39): the ones that
+# change how a codeunit behaves at runtime and cannot be recovered from edges.
+# Maps the AL property name (lowercased) -> the graph attribute key.
+_AL_OBJECT_PROP_ATTRS = {
+    "singleinstance": "al_single_instance",
+    "subtype": "al_subtype",
+    "access": "al_access",
+    "permissions": "al_permissions",
+    "inherententitlements": "al_inherent_entitlements",
+    "inherentpermissions": "al_inherent_permissions",
+}
+
+
+def _al_trigger_kind(name: str) -> str:
+    """Classify an AL trigger name into a coarse marker (#39).
+
+    `OnRun` is the runnable entrypoint; install/upgrade triggers drive the
+    Install/Upgrade lifecycle. Everything else (page/table/field triggers such
+    as OnValidate, OnOpenPage, OnAfterGetRecord) is `other`.
+    """
+    low = name.lower()
+    if low == "onrun":
+        return "run"
+    if low.startswith("oninstall"):
+        return "install"
+    if low.startswith("onupgrade"):
+        return "upgrade"
+    return "other"
+
+
+def _al_collect_semantic_attrs(tree, source: bytes) -> dict[int, dict]:
+    """Map a source line -> semantic node attributes for the node on it (#39).
+
+    Captures, without adding any nodes or edges:
+    - object properties (`al_single_instance`, `al_subtype`, `al_access`,
+      `al_permissions`, `al_inherent_entitlements`, `al_inherent_permissions`)
+      on the object node;
+    - procedure scope (`al_scope`: `local` / `internal` / `global`) and the
+      `al_try_function` flag on procedure nodes;
+    - trigger typing (`al_trigger` = trigger name, `al_trigger_kind` =
+      run/install/upgrade/other) on trigger nodes.
+
+    Keyed by the declaration line of the graph node the attribute belongs to,
+    mirroring `_al_collect_node_text` so the same merge pass can attach them.
+    """
+    out: dict[int, dict] = {}
+
+    def text(n) -> str:
+        return source[n.start_byte:n.end_byte].decode("utf-8", "replace")
+
+    def line(n) -> int:
+        return n.start_point[0] + 1
+
+    def put(ln: int, key: str, val) -> None:
+        out.setdefault(ln, {}).setdefault(key, val)
+
+    def prop_value_text(prop):
+        # The value is everything between the `=` token and the trailing `;`.
+        seen_eq = False
+        parts: list[str] = []
+        for ch in prop.children:
+            if ch.type == "=":
+                seen_eq = True
+                continue
+            if ch.type == ";":
+                break
+            if seen_eq:
+                parts.append(text(ch))
+        return " ".join(p for p in (s.strip() for s in parts) if p)
+
+    def has_try_function(proc) -> bool:
+        # `[TryFunction]` is an `attribute_item` sitting as a preceding sibling
+        # of the procedure node.
+        sib = proc.prev_sibling
+        while sib is not None:
+            if sib.type == "attribute_item":
+                for d in sib.children:
+                    if d.type == "attribute_content":
+                        for dd in d.children:
+                            if dd.type == "identifier" and text(dd).lower() == "tryfunction":
+                                return True
+            elif sib.type == "comment":
+                pass  # comments/attributes may interleave; keep scanning up
+            else:
+                break
+            sib = sib.prev_sibling
+        return False
+
+    def obj_body(obj):
+        for c in obj.children:
+            if c.type in ("declaration_body", "code_block", "statement_block"):
+                return c
+        return None
+
+    def handle_object(obj) -> None:
+        oline = line(obj)
+        body = obj_body(obj)
+        if body is not None:
+            # Object-level properties only (direct children of the body), so a
+            # member's property never bleeds onto the object node.
+            for c in body.children:
+                if c.type != "property":
+                    continue
+                name = None
+                for ch in c.children:
+                    if ch.type == "property_name":
+                        name = text(ch).strip().lower()
+                        break
+                if name in _AL_OBJECT_PROP_ATTRS:
+                    val = prop_value_text(c)
+                    if val:
+                        put(oline, _AL_OBJECT_PROP_ATTRS[name], val)
+
+        def rec(n) -> None:
+            for c in n.children:
+                if c.type == "procedure":
+                    scope = "global"
+                    for ch in c.children:
+                        if ch.type == "procedure_modifier":
+                            mtext = text(ch).strip().lower()
+                            if "local" in mtext:
+                                scope = "local"
+                            elif "internal" in mtext:
+                                scope = "internal"
+                            break
+                    put(line(c), "al_scope", scope)
+                    if has_try_function(c):
+                        put(line(c), "al_try_function", True)
+                elif c.type == "trigger_declaration":
+                    tname = None
+                    for ch in c.children:
+                        if ch.type == "identifier":
+                            tname = text(ch).strip()
+                            break
+                    if tname:
+                        put(line(c), "al_trigger", tname)
+                        put(line(c), "al_trigger_kind", _al_trigger_kind(tname))
+                rec(c)
+
+        rec(body if body is not None else obj)
+
+    def find_objs(n) -> None:
+        if n.type in _AL_CONFIG.class_types:
+            handle_object(n)
+            return
+        for c in n.children:
+            find_objs(c)
+
+    find_objs(tree.root_node)
+    return out
+
+
 def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
     """Resolve per-file AL facts to edges against the global node set.
 
@@ -5827,7 +5979,10 @@ def extract_al(path: Path) -> dict:
         # Additively attach human-facing text (Caption/ToolTip/Label/XML-doc)
         # onto the object/procedure node sitting on each source line.
         text_by_line = _al_collect_node_text(tree, src)
-        if text_by_line:
+        # #39: object properties, procedure scope, trigger typing, [TryFunction]
+        # — additively stamped onto the same line-keyed nodes.
+        sem_by_line = _al_collect_semantic_attrs(tree, src)
+        if text_by_line or sem_by_line:
             for n in result.get("nodes", []):
                 loc = str(n.get("source_location", ""))
                 if loc[:1] != "L":
@@ -5836,10 +5991,18 @@ def extract_al(path: Path) -> dict:
                     ln = int(loc[1:])
                 except ValueError:
                     continue
-                attrs = text_by_line.get(ln)
-                if attrs:
-                    for k, v in attrs.items():
-                        n.setdefault(k, v)
+                lbl = str(n.get("label", ""))
+                # The file node can share the object's declaration line (object on
+                # line 1). Semantic attrs belong to the object/procedure/trigger
+                # node, never the file node — mirror the global_id guard.
+                is_file_node = lbl.endswith(".al")
+                for src_map in (text_by_line, sem_by_line):
+                    if src_map is sem_by_line and is_file_node:
+                        continue
+                    attrs = src_map.get(ln)
+                    if attrs:
+                        for k, v in attrs.items():
+                            n.setdefault(k, v)
     except Exception:
         result.setdefault("al_facts", [])
     return result
