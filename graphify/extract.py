@@ -3212,6 +3212,55 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
                 return
 
             line = node.start_point[0] + 1
+
+            # AL: a field's `OnValidate` trigger must attach to its FIELD node, not
+            # collapse onto one object-level `<obj>_onvalidate` node (all a table's
+            # field triggers otherwise share that id and all but one are lost). The
+            # generic recurse reaches the trigger with parent_class_nid cleared, so
+            # the enclosing field/modify and object are recovered from the ancestor
+            # chain and the trigger is given a field-qualified id parented to the
+            # field. A tableextension `modify(<Field>)` trigger extends a base-table
+            # field (a different object); it is parented to this tableext with a
+            # field-qualified id, and the cross-object edge to the base field node is
+            # emitted separately via al_facts.
+            if config.ts_module == "tree_sitter_al" and t == "trigger_declaration":
+                fld_name = None
+                in_modify = False
+                obj_name = None
+                anc = node.parent
+                while anc is not None:
+                    at = anc.type
+                    if fld_name is None and at in ("field_declaration", "modify_modification"):
+                        fld_name = next((_read_text(c, source) for c in anc.children
+                                         if c.type in ("quoted_identifier", "identifier")), None)
+                        in_modify = at == "modify_modification"
+                    if at in config.class_types:
+                        onn = anc.child_by_field_name(config.name_field)
+                        if onn is None:
+                            for ch in anc.children:
+                                if ch.type in config.name_fallback_child_types:
+                                    onn = ch
+                                    break
+                        if onn is not None:
+                            obj_name = _read_text(onn, source)
+                        break
+                    anc = anc.parent
+                if fld_name and obj_name:
+                    al_class_nid = _make_id(stem, obj_name)
+                    if in_modify:
+                        trig_nid = _make_id(al_class_nid, "modify", fld_name, func_name)
+                        add_node(trig_nid, f".{func_name}()", line)
+                        add_edge(al_class_nid, trig_nid, "trigger", line)
+                    else:
+                        field_nid = _make_id(al_class_nid, fld_name)
+                        trig_nid = _make_id(field_nid, func_name)
+                        add_node(trig_nid, f".{func_name}()", line)
+                        add_edge(field_nid, trig_nid, "trigger", line)
+                    tbody = _find_body(node, config)
+                    if tbody:
+                        function_bodies.append((trig_nid, tbody))
+                    return
+
             if parent_class_nid:
                 func_nid = _make_id(parent_class_nid, func_name)
                 add_node(func_nid, f".{func_name}()", line)
@@ -4711,10 +4760,13 @@ _AL_RUN_KEYWORDS = frozenset({"codeunit", "page", "report"})
 _AL_RUN_METHODS = frozenset({"run", "runmodal"})
 
 # EventSubscriber(ObjectType::Codeunit, Codeunit::"Name" | Database::"Name" | 80,
-#                 'OnEvent' | OnEvent, ...)
+#                 'OnEvent' | OnEvent, 'FieldFilter', ...)
+# The optional 4th positional argument is the element/field filter: for a table's
+# OnBefore/OnAfterValidateEvent it names the field whose validation is subscribed.
 _AL_EVENT_RE = re.compile(
     r'ObjectType::(\w+)\s*,\s*(?:\w+::)?(?:"([^"]+)"|(\d+)|([A-Za-z0-9_]+))\s*,\s*'
-    r"(?:'([^']*)'|([A-Za-z0-9_]+))",
+    r"(?:'([^']*)'|([A-Za-z0-9_]+))"
+    r"(?:\s*,\s*'([^']*)')?",
     re.IGNORECASE,
 )
 
@@ -4762,7 +4814,7 @@ def _al_parse_event_subscriber(attr_text: str):
     m = _AL_EVENT_RE.search(attr_text)
     if not m:
         return None
-    objtype, qname, num, ident, ev_q, ev_b = m.groups()
+    objtype, qname, num, ident, ev_q, ev_b, fld = m.groups()
     name = qname or ident
     if name:
         target = name
@@ -4770,7 +4822,7 @@ def _al_parse_event_subscriber(attr_text: str):
         target = f"{objtype} {num}"  # numeric base-object id, e.g. "Codeunit 80"
     else:
         return None
-    return {"target": target, "event": ev_q or ev_b or ""}
+    return {"target": target, "event": ev_q or ev_b or "", "field": fld or ""}
 
 
 def _al_parse_event_publisher(attr_text: str):
@@ -4942,6 +4994,29 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
         for c in node.children:
             collect_table_relations(c, obj_line)
 
+    def collect_modify_field_validate(node, base_name: str) -> None:
+        if node.type == "modify_modification":
+            fld = next((text(c) for c in node.children
+                        if c.type in ("quoted_identifier", "identifier")), None)
+            if fld:
+                fld = _al_strip_quotes(fld)
+
+                def find_validate(n) -> None:
+                    if n.type == "trigger_declaration":
+                        tname = next((text(c) for c in n.children
+                                      if c.type in ("identifier", "quoted_identifier")), "")
+                        if tname.lower() == "onvalidate":
+                            facts.append({"kind": "validates_field", "src_line": line(n),
+                                          "target": base_name, "field": fld})
+                        return
+                    for c in n.children:
+                        find_validate(c)
+
+                find_validate(node)
+            return
+        for c in node.children:
+            collect_modify_field_validate(c, base_name)
+
     def walk_calc_formulas(node, obj_line: int) -> None:
         # FlowField CalcFormula (sum/count/exist/average/min/max -> aggregate_formula,
         # lookup -> lookup_formula) each carry a `calc_field_reference` naming the
@@ -4967,6 +5042,13 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                           "target": _al_strip_quotes(text(base))})
         if obj.type in ("table_declaration", "tableextension_declaration"):
             collect_table_relations(obj, obj_line)
+        if obj.type == "tableextension_declaration" and base is not None:
+            # `modify(<Field>) { trigger OnValidate() }` extends a field that lives
+            # in the BASE table (a different object). Emit a fact linking the
+            # (field-qualified) modify trigger node to that base field's node so the
+            # field's full validation dispatch is reachable cross-object.
+            base_name = _al_strip_quotes(text(base))
+            collect_modify_field_validate(obj, base_name)
         walk_calc_formulas(obj, obj_line)
         # `object X implements IFoo, IBar` (codeunit/enum): one edge per interface.
         for c in obj.children:
@@ -5238,6 +5320,7 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
 
     new_nodes: list[dict] = []
     ext_cache: dict[str, str] = {}
+    existing_ids: set = {n["id"] for n in all_nodes}
 
     def ensure_external(label: str) -> str:
         key = label.lower()
@@ -5249,6 +5332,18 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
                           "_origin": "al_external", "id": nid})
         ext_cache[key] = nid
         return nid
+
+    def resolve_field(table_name: str, field_name: str) -> str:
+        """Node id of `table_name`.`field_name`: the real in-corpus field node when
+        it exists, else an external stub labeled `Table.Field` (mirrors how object
+        targets fall back to `ensure_external`)."""
+        tnid = obj_by_name.get(_al_strip_quotes(table_name).lower())
+        if tnid:
+            cand = _make_id(tnid, field_name)
+            if cand in existing_ids:
+                return cand
+        return ensure_external(
+            f"{_al_strip_quotes(table_name)}.{_al_strip_quotes(field_name)}")
 
     _REL = {"extends": "extends", "subscribes": "subscribes",
             "calls": "calls", "uses": "references", "binds": "binds",
@@ -5348,6 +5443,25 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
                             "source_location": f"L{f.get('src_line', '')}", "weight": 1.0,
                         })
                 continue
+            if f["kind"] == "validates_field":
+                # tableextension modify(<Field>){OnValidate}: link the modify
+                # trigger node (this file, resolved by line) to the base field node.
+                src = line2nid.get(f.get("src_line"))
+                tname = f.get("target")
+                fld = f.get("field")
+                if src and tname and fld:
+                    tgt = resolve_field(tname, fld)
+                    if src != tgt:
+                        pair = (src, tgt, "validates")
+                        if pair not in seen:
+                            seen.add(pair)
+                            new_edges.append({
+                                "source": src, "target": tgt, "relation": "validates",
+                                "context": "al_validates_field", "confidence": "EXTRACTED",
+                                "confidence_score": 0.9, "source_file": sf,
+                                "source_location": f"L{f.get('src_line', '')}", "weight": 1.0,
+                            })
+                continue
             tname = f.get("target")
             if not tname:
                 continue
@@ -5385,7 +5499,13 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
                     tgt = proc_by_objmeth.get((tgt, str(f.get("method", "")).lower()), tgt)
                 elif f["kind"] == "subscribes":
                     evname = str(f.get("event", "")).lower()
-                    if evname:
+                    fldname = str(f.get("field", "")).strip()
+                    if fldname and "validate" in evname:
+                        # OnBefore/OnAfterValidateEvent's 4th arg names the field;
+                        # resolve to that field's node so the subscription attaches
+                        # to the field, not the whole table.
+                        tgt = resolve_field(tname, fldname)
+                    elif evname:
                         tgt = proc_by_objmeth.get((tgt, evname), tgt)
             if src == tgt:
                 continue
