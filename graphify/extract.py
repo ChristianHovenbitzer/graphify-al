@@ -4700,6 +4700,28 @@ def _al_type_object(type_text: str):
     return (m.group(1).lower(), m.group(2) or m.group(3))
 
 
+# enum value `Implementation = IFace = Impl [, IFace2 = Impl2]` binding.
+# A single binding and a comma-separated list parse to different tree-sitter-al
+# node shapes, so the property text is parsed uniformly here instead.
+_AL_IMPL_PAIR_RE = re.compile(
+    r'([A-Za-z0-9_]+|"[^"]+")\s*=\s*([A-Za-z0-9_]+|"[^"]+")'
+)
+
+
+def _al_parse_implementation(prop_text: str):
+    """[(interface, impl), ...] from an enum value `Implementation` property text."""
+    rhs = prop_text.split("=", 1)
+    if len(rhs) < 2:
+        return []
+    pairs = []
+    for m in _AL_IMPL_PAIR_RE.finditer(rhs[1]):
+        iface = _al_strip_quotes(m.group(1))
+        impl = _al_strip_quotes(m.group(2))
+        if iface and impl:
+            pairs.append((iface, impl))
+    return pairs
+
+
 def _al_parse_event_subscriber(attr_text: str):
     if "eventsubscriber" not in attr_text.lower():
         return None
@@ -4756,9 +4778,40 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
         if base is not None:
             facts.append({"kind": "extends", "src_line": obj_line,
                           "target": _al_strip_quotes(text(base))})
+        # `object X implements IFoo, IBar` (codeunit/enum): one edge per interface.
+        for c in obj.children:
+            if c.type == "implements_clause":
+                for name_node in c.children:
+                    if name_node.type in ("identifier", "quoted_identifier"):
+                        facts.append({"kind": "implements", "src_line": obj_line,
+                                      "target": _al_strip_quotes(text(name_node))})
         body = obj.child_by_field_name("body")
         if body is None:
             return
+        # enum value `Implementation = IFace = Impl` bindings: the enum binds the
+        # concrete impl (enum_binds_implementation) and that impl implements IFace.
+        for c in body.children:
+            if c.type != "enum_value_declaration":
+                continue
+            vbody = c.child_by_field_name("body")
+            if vbody is None:
+                for cc in c.children:
+                    if cc.type == "declaration_body":
+                        vbody = cc
+                        break
+            if vbody is None:
+                continue
+            for prop in vbody.children:
+                if prop.type != "property":
+                    continue
+                ptext = text(prop)
+                if not re.match(r"\s*Implementation\b", ptext, re.IGNORECASE):
+                    continue
+                for iface, impl in _al_parse_implementation(ptext):
+                    facts.append({"kind": "enum_binds_implementation",
+                                  "src_line": obj_line, "target": impl})
+                    facts.append({"kind": "implements",
+                                  "src_name": impl, "target": iface})
         obj_vars: dict = {}
         for c in body.children:
             if c.type == "var_section":
@@ -4847,7 +4900,11 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
         return nid
 
     _REL = {"extends": "extends", "subscribes": "subscribes",
-            "calls": "calls", "uses": "references"}
+            "calls": "calls", "uses": "references",
+            "implements": "implements",
+            "enum_binds_implementation": "enum_binds_implementation"}
+    _EXTRACTED = frozenset({"extends", "subscribes", "implements",
+                            "enum_binds_implementation"})
     new_edges: list[dict] = []
     seen: set = set()
     for result in per_file:
@@ -4858,19 +4915,39 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
             continue
         nodes = result.get("nodes", [])
         line2nid: dict[int, str] = {}
+        file_line: dict[int, str] = {}
         sf = ""
         for n in nodes:
             sf = sf or n.get("source_file", "")
             loc = str(n.get("source_location", ""))
-            if loc[:1] == "L":
-                try:
-                    line2nid.setdefault(int(loc[1:]), n["id"])
-                except ValueError:
-                    pass
+            if loc[:1] != "L":
+                continue
+            try:
+                ln = int(loc[1:])
+            except ValueError:
+                continue
+            # The file node shares line 1 with the object declared there; object
+            # (and procedure) nodes must win so declaration-level edges land on the
+            # object rather than the file node.
+            if str(n.get("label", "")).endswith(".al"):
+                file_line.setdefault(ln, n["id"])
+            else:
+                line2nid.setdefault(ln, n["id"])
+        for ln, nid in file_line.items():
+            line2nid.setdefault(ln, nid)
         for f in facts:
-            src = line2nid.get(f.get("src_line"))
             tname = f.get("target")
-            if not src or not tname:
+            if not tname:
+                continue
+            src_name = f.get("src_name")
+            if src_name:
+                # source resolved by object name (e.g. an enum-bound impl codeunit
+                # that may live in another file) rather than by line in this file.
+                src = (obj_by_name.get(_al_strip_quotes(src_name).lower())
+                       or ensure_external(src_name))
+            else:
+                src = line2nid.get(f.get("src_line"))
+            if not src:
                 continue
             tgt = obj_by_name.get(_al_strip_quotes(tname).lower()) or ensure_external(tname)
             if f["kind"] == "calls":
@@ -4885,7 +4962,7 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
             new_edges.append({
                 "source": src, "target": tgt, "relation": rel,
                 "context": "al_" + f["kind"],
-                "confidence": "EXTRACTED" if f["kind"] in ("extends", "subscribes") else "INFERRED",
+                "confidence": "EXTRACTED" if f["kind"] in _EXTRACTED else "INFERRED",
                 "confidence_score": 0.9, "source_file": sf,
                 "source_location": f"L{f.get('src_line', '')}", "weight": 1.0,
             })
