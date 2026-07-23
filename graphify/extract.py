@@ -2295,7 +2295,9 @@ _AL_MEMBER_TYPES = frozenset({
     "page_field",               # page / pageextension control
     "action_declaration",       # page / pageextension action
     "report_dataitem",          # report dataitem (may nest)
+    "report_column",            # report dataset column (source-field mapping)
     "query_dataitem",           # query dataitem (may nest)
+    "query_column",             # query column (source-field mapping)
     "xmlport_element",          # xmlport text/table/field element (may nest)
 })
 
@@ -5204,8 +5206,36 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
         for c in node.children:
             walk_calc_formulas(c, obj_line)
 
+    def collect_columns(node, current_table: str) -> None:
+        # report/query dataset columns map to a field of the enclosing dataitem's
+        # bound table. Thread that table down while descending; a nested dataitem
+        # rebinds it. Emit a `column_source` fact per column whose source is a bare
+        # field reference (identifier/quoted_identifier) — skipping computed
+        # expressions, which have no single source field — attributed to the
+        # column's own line so it resolves to that column's member node (#32).
+        t = node.type
+        if t in ("report_dataitem", "query_dataitem"):
+            tn = node.child_by_field_name("table_name")
+            current_table = _al_strip_quotes(text(tn)) if tn is not None else current_table
+        elif t in ("report_column", "query_column") and current_table:
+            src_node = node.child_by_field_name("source")
+            if src_node is None:
+                # query_column exposes the source only positionally: the named
+                # identifier/quoted_identifier child after the column name.
+                idents = [c for c in node.children
+                          if c.type in ("identifier", "quoted_identifier")]
+                src_node = idents[1] if len(idents) > 1 else None
+            if src_node is not None and src_node.type in ("identifier", "quoted_identifier"):
+                facts.append({"kind": "column_source", "src_line": line(node),
+                              "target": current_table,
+                              "field": _al_strip_quotes(text(src_node))})
+        for c in node.children:
+            collect_columns(c, current_table)
+
     def walk_obj(obj) -> None:
         obj_line = line(obj)
+        if obj.type in ("report_declaration", "query_declaration"):
+            collect_columns(obj, "")
         base = obj.child_by_field_name("base_object")
         if base is not None:
             facts.append({"kind": "extends", "src_line": obj_line,
@@ -5704,6 +5734,26 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
                             new_edges.append({
                                 "source": src, "target": tgt, "relation": "validates",
                                 "context": "al_validates_field", "confidence": "EXTRACTED",
+                                "confidence_score": 0.9, "source_file": sf,
+                                "source_location": f"L{f.get('src_line', '')}", "weight": 1.0,
+                            })
+                continue
+            if f["kind"] == "column_source":
+                # report/query dataset column -> the field of the dataitem's bound
+                # table it reads. Link the column member node (this file, resolved
+                # by line) to that source-field node (#32).
+                src = line2nid.get(f.get("src_line"))
+                tname = f.get("target")
+                fld = f.get("field")
+                if src and tname and fld:
+                    tgt = resolve_field(tname, fld)
+                    if src != tgt:
+                        pair = (src, tgt, "references")
+                        if pair not in seen:
+                            seen.add(pair)
+                            new_edges.append({
+                                "source": src, "target": tgt, "relation": "references",
+                                "context": "al_column_source", "confidence": "EXTRACTED",
                                 "confidence_score": 0.9, "source_file": sf,
                                 "source_location": f"L{f.get('src_line', '')}", "weight": 1.0,
                             })
