@@ -4746,6 +4746,16 @@ def _al_parse_event_subscriber(attr_text: str):
     return {"target": target, "event": ev_q or ev_b or ""}
 
 
+def _al_parse_event_publisher(attr_text: str):
+    """'integration'/'business' for an [IntegrationEvent]/[BusinessEvent] attribute, else None."""
+    low = attr_text.lower()
+    if "integrationevent" in low:
+        return "integration"
+    if "businessevent" in low:
+        return "business"
+    return None
+
+
 def _al_collect_facts(tree, source: bytes) -> list[dict]:
     facts: list[dict] = []
 
@@ -4874,6 +4884,10 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                     ev = _al_parse_event_subscriber(a)
                     if ev:
                         facts.append({"kind": "subscribes", "src_line": proc_line, **ev})
+                    pub = _al_parse_event_publisher(a)
+                    if pub:
+                        facts.append({"kind": "event_publisher", "src_line": proc_line,
+                                      "event_type": pub})
                 vm = dict(obj_vars)
                 for pc in c.children:
                     if pc.type in ("parameter_list", "var_section"):
@@ -4960,17 +4974,25 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
             continue
         nodes = result.get("nodes", [])
         line2nid: dict[int, str] = {}
+        line2node: dict[int, dict] = {}
         sf = ""
         for n in nodes:
             sf = sf or n.get("source_file", "")
             loc = str(n.get("source_location", ""))
             if loc[:1] == "L":
                 try:
-                    line2nid.setdefault(int(loc[1:]), n["id"])
+                    ln = int(loc[1:])
                 except ValueError:
-                    pass
+                    continue
+                line2nid.setdefault(ln, n["id"])
+                line2node.setdefault(ln, n)
         for f in facts:
             src = line2nid.get(f.get("src_line"))
+            if f["kind"] == "event_publisher":
+                node = line2node.get(f.get("src_line"))
+                if node is not None:
+                    node["event"] = f["event_type"]
+                continue
             tname = f.get("target")
             if not src or not tname:
                 continue
@@ -4990,6 +5012,10 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
                 tgt = obj_by_name.get(key) or ensure_external(tname)
                 if f["kind"] == "calls":
                     tgt = proc_by_objmeth.get((tgt, str(f.get("method", "")).lower()), tgt)
+                elif f["kind"] == "subscribes":
+                    evname = str(f.get("event", "")).lower()
+                    if evname:
+                        tgt = proc_by_objmeth.get((tgt, evname), tgt)
             if src == tgt:
                 continue
             rel = _REL[f["kind"]]
