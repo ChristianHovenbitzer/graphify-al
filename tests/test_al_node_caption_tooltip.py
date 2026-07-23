@@ -51,10 +51,15 @@ def test_al_node_text_attributes(tmp_path: Path):
     assert obj["label"] == "SampleThing"          # existing display name is untouched
     assert obj["doc"] == "The sample record table."
     assert obj["al_label"] == "A reusable message."
-    # Fields have no dedicated graph node, so their Caption/ToolTip attach to the
-    # nearest enclosing (object) node.
-    assert obj["caption"] == "Name"
-    assert obj["tooltip"] == "Specifies the name."
+    # #36: a member's Caption/ToolTip attaches to the MEMBER's own node, never to
+    # the enclosing object (no attribute bleed-through). The table has no own
+    # Caption, so the object node must NOT carry the "Name" field's caption.
+    assert "caption" not in obj
+    assert "tooltip" not in obj
+    # The Name field node (declared on line 6) carries its own Caption/ToolTip.
+    name_field = next(n for n in nodes if n.get("label") == ".Name")
+    assert name_field["caption"] == "Name"
+    assert name_field["tooltip"] == "Specifies the name."
 
     # Procedure node carries its own /// summary as `doc`.
     proc = next(n for n in nodes if n.get("label") == ".DoThing()")

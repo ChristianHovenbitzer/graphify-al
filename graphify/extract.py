@@ -2280,6 +2280,69 @@ _AL_CONFIG = LanguageConfig(
 )
 
 
+# AL "member" container nodes: object members that own their own triggers,
+# captions and (for dataitems/elements) nested members. Each is nested BELOW an
+# intermediate section node (fields_section, layout, actions, dataset, schema,
+# elements), where the generic recurse clears parent_class_nid — so triggers and
+# text attributes nested inside them fall to the file-level fallback unless we
+# thread the enclosing object + owning member back in. Keeping this list in one
+# place keeps member-node creation (_al_collect_members), nested-trigger
+# anchoring (the trigger handler) and member-caption collection
+# (_al_collect_node_text) in agreement on what counts as a member (#34, #36).
+_AL_MEMBER_TYPES = frozenset({
+    "field_declaration",        # table / tableextension field
+    "enum_value_declaration",   # enum / enumextension value
+    "page_field",               # page / pageextension control
+    "action_declaration",       # page / pageextension action
+    "report_dataitem",          # report dataitem (may nest)
+    "query_dataitem",           # query dataitem (may nest)
+    "xmlport_element",          # xmlport text/table/field element (may nest)
+})
+
+
+def _al_member_name(decl, source: bytes) -> str | None:
+    """Name of an AL member declaration.
+
+    Most members expose it via the ``name`` field; enum values use ``value_name``.
+    Fall back to the first identifier/quoted_identifier child (table fields, whose
+    declaration leads with the name token). Returns the raw source text (quotes
+    included for quoted identifiers) so it normalizes the same way everywhere.
+    """
+    nm = decl.child_by_field_name("name")
+    if nm is None:
+        nm = decl.child_by_field_name("value_name")
+    if nm is not None:
+        return _read_text(nm, source)
+    for c in decl.children:
+        if c.type in ("quoted_identifier", "identifier"):
+            return _read_text(c, source)
+    return None
+
+
+def _al_member_id(parent_nid: str, raw_name: str | None, seq: int,
+                  used: set[str]) -> tuple[str, bool]:
+    """Stable, collision-free member id under ``parent_nid`` (#35).
+
+    ``_make_id(parent_nid, name)`` returns the parent id verbatim when the name
+    NFKC-normalizes to empty (the conventional blank/whitespace enum value), which
+    degenerates the ``contains`` edge into a self-loop and drops the node; two
+    members whose names normalize to the same string likewise merge. Fall back to
+    a positional segment (``memberN``) when the name is empty OR the id is already
+    taken in this parent, and bump N until unique. Returns ``(id, synthetic)`` so
+    the caller can label a nameless member sensibly.
+    """
+    cand = _make_id(parent_nid, raw_name) if raw_name else parent_nid
+    synthetic = cand == parent_nid or cand in used
+    if synthetic:
+        n = seq
+        cand = _make_id(parent_nid, f"member{n}")
+        while cand in used:
+            n += 1
+            cand = _make_id(parent_nid, f"member{n}")
+    used.add(cand)
+    return cand, synthetic
+
+
 def _resolve_lua_import_target(raw_module: str, str_path: str) -> str:
     """Resolve a Lua require() module name to a node id.
 
@@ -2961,33 +3024,46 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
                                 seen_ids.add(base_nid)
                         add_edge(class_nid, base_nid, "inherits", line)
 
-            # AL-specific: table fields and enum values are first-class members,
-            # each contained by its parent object. Unlike procedures they are
-            # nested below intermediate section nodes (fields_section/fields_body),
-            # where the generic recurse below clears parent_class_nid — so they are
-            # collected here while class_nid is in scope. Keyed parent-qualified,
-            # exactly like procedure nodes; label uses a `.name` form (no `()`) so
-            # method-detecting code and the object-name resolver both skip them.
+            # AL-specific: object members (table/tableext fields, enum values, page
+            # controls & actions, report/query dataitems, xmlport elements) are
+            # first-class nodes contained by their owner. Unlike procedures they are
+            # nested below intermediate section nodes (fields_section, layout,
+            # actions, dataset, schema, ...), where the generic recurse below clears
+            # parent_class_nid — so they are collected here while class_nid is in
+            # scope. Keyed parent-qualified, exactly like procedure nodes; label uses
+            # a `.name` form (no `()`) so method-detecting code and the object-name
+            # resolver both skip them. Nested members (a dataitem inside a dataitem,
+            # a tableelement inside a textelement) are qualified by their owning
+            # member, not just the object, so same-named members under different
+            # parents stay distinct. The trigger handler below reconstructs these
+            # exact ids to anchor a member's triggers (#34).
             if config.ts_module == "tree_sitter_al":
-                def _al_member_name(decl):
-                    for c in decl.children:
-                        if c.type in ("quoted_identifier", "identifier"):
-                            return _read_text(c, source)
-                    return None
+                used_member_ids: set[str] = set()
 
-                def _al_collect_members(n):
-                    if n.type in ("field_declaration", "enum_value_declaration"):
-                        member_name = _al_member_name(n)
-                        if member_name:
-                            m_line = n.start_point[0] + 1
-                            m_nid = _make_id(class_nid, member_name)
-                            add_node(m_nid, f".{member_name}", m_line)
-                            add_edge(class_nid, m_nid, "contains", m_line)
+                def _al_collect_members(n, parent_nid, seq):
+                    if n.type in _AL_MEMBER_TYPES:
+                        member_name = _al_member_name(n, source)
+                        m_line = n.start_point[0] + 1
+                        seq[0] += 1
+                        m_nid, _synthetic = _al_member_id(
+                            parent_nid, member_name, seq[0], used_member_ids)
+                        # A name that normalizes to empty (blank enum value) gets a
+                        # positional label so the node is still identifiable.
+                        label = (f".{member_name}"
+                                 if member_name and _make_id(member_name)
+                                 else f".member{seq[0]}")
+                        add_node(m_nid, label, m_line)
+                        add_edge(parent_nid, m_nid, "contains", m_line)
+                        # Recurse INTO the member for nested members, qualified by
+                        # this member; nested sequence numbers are scoped per parent.
+                        child_seq = [0]
+                        for c in n.children:
+                            _al_collect_members(c, m_nid, child_seq)
                         return
                     for c in n.children:
-                        _al_collect_members(c)
+                        _al_collect_members(c, parent_nid, seq)
 
-                _al_collect_members(node)
+                _al_collect_members(node, class_nid, [0])
 
             # Find body and recurse
             body = _find_body(node, config)
@@ -3213,27 +3289,39 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
 
             line = node.start_point[0] + 1
 
-            # AL: a field's `OnValidate` trigger must attach to its FIELD node, not
-            # collapse onto one object-level `<obj>_onvalidate` node (all a table's
-            # field triggers otherwise share that id and all but one are lost). The
-            # generic recurse reaches the trigger with parent_class_nid cleared, so
-            # the enclosing field/modify and object are recovered from the ancestor
-            # chain and the trigger is given a field-qualified id parented to the
-            # field. A tableextension `modify(<Field>)` trigger extends a base-table
-            # field (a different object); it is parented to this tableext with a
-            # field-qualified id, and the cross-object edge to the base field node is
-            # emitted separately via al_facts.
+            # AL: a trigger nested inside an object member (field OnValidate, page
+            # control/action OnValidate/OnAction, report/query dataitem or xmlport
+            # element trigger) must attach to that MEMBER's node, not collapse onto
+            # one object/file-level `<obj>_<triggertype>` node. The generic recurse
+            # reaches the trigger with parent_class_nid cleared, so the enclosing
+            # member chain and object are recovered from the ancestor chain and the
+            # trigger is given a member-qualified id parented to the member. The id
+            # is rebuilt from the same object+member-name chain _al_collect_members
+            # uses, so the member node the trigger hangs off is the real one. Two
+            # same-type triggers in one object therefore land on their own member
+            # nodes instead of colliding (which silently dropped all but one and bled
+            # their `calls` onto the survivor). A tableextension `modify(<Field>)`
+            # trigger extends a field living in the BASE table (a different object):
+            # it is parented to this tableext with a modify-qualified id, and the
+            # cross-object edge to the base field is emitted separately via al_facts.
+            # Object-DIRECT triggers have no member ancestor and fall through to the
+            # normal method/contains path below, unchanged (#34, generalizes #26).
             if config.ts_module == "tree_sitter_al" and t == "trigger_declaration":
-                fld_name = None
-                in_modify = False
                 obj_name = None
+                modify_field = None
+                member_chain: list[str] = []   # nearest-first member names
                 anc = node.parent
                 while anc is not None:
                     at = anc.type
-                    if fld_name is None and at in ("field_declaration", "modify_modification"):
-                        fld_name = next((_read_text(c, source) for c in anc.children
-                                         if c.type in ("quoted_identifier", "identifier")), None)
-                        in_modify = at == "modify_modification"
+                    if (at == "modify_modification"
+                            and modify_field is None and not member_chain):
+                        modify_field = next(
+                            (_read_text(c, source) for c in anc.children
+                             if c.type in ("quoted_identifier", "identifier")), None)
+                    elif at in _AL_MEMBER_TYPES:
+                        mname = _al_member_name(anc, source)
+                        if mname:
+                            member_chain.append(mname)
                     if at in config.class_types:
                         onn = anc.child_by_field_name(config.name_field)
                         if onn is None:
@@ -3245,17 +3333,19 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
                             obj_name = _read_text(onn, source)
                         break
                     anc = anc.parent
-                if fld_name and obj_name:
+                if obj_name and (member_chain or modify_field):
                     al_class_nid = _make_id(stem, obj_name)
-                    if in_modify:
-                        trig_nid = _make_id(al_class_nid, "modify", fld_name, func_name)
+                    if modify_field:
+                        trig_nid = _make_id(al_class_nid, "modify", modify_field, func_name)
                         add_node(trig_nid, f".{func_name}()", line)
                         add_edge(al_class_nid, trig_nid, "trigger", line)
                     else:
-                        field_nid = _make_id(al_class_nid, fld_name)
-                        trig_nid = _make_id(field_nid, func_name)
+                        member_nid = al_class_nid
+                        for mname in reversed(member_chain):
+                            member_nid = _make_id(member_nid, mname)
+                        trig_nid = _make_id(member_nid, func_name)
                         add_node(trig_nid, f".{func_name}()", line)
-                        add_edge(field_nid, trig_nid, "trigger", line)
+                        add_edge(member_nid, trig_nid, "trigger", line)
                     tbody = _find_body(node, config)
                     if tbody:
                         function_bodies.append((trig_nid, tbody))
@@ -5205,8 +5295,14 @@ def _al_collect_node_text(tree, source: bytes) -> dict[int, dict]:
                 return c
         return None
 
-    def collect_field(fd, oline: int) -> None:
-        for c in fd.children:
+    def collect_member(m) -> None:
+        # #36: attach a member's own Caption/ToolTip to the MEMBER's node (keyed by
+        # its declaration line), never to the enclosing object. Previously a field's
+        # Caption was keyed at the object line, so an object with no own caption
+        # (e.g. a tableextension) silently adopted its first field's caption
+        # (attribute bleed-through) and member captions were never stored.
+        mline = line(m)
+        for c in m.children:
             if c.type != "declaration_body":
                 continue
             for p in c.children:
@@ -5216,9 +5312,9 @@ def _al_collect_node_text(tree, source: bytes) -> dict[int, dict]:
                         continue
                     lname = name.lower()
                     if lname == "caption":
-                        put(oline, "caption", val)
+                        put(mline, "caption", val)
                     elif lname == "tooltip":
-                        put(oline, "tooltip", val)
+                        put(mline, "tooltip", val)
 
     def collect_labels(section, oline: int) -> None:
         for vb in section.children:
@@ -5263,8 +5359,8 @@ def _al_collect_node_text(tree, source: bytes) -> dict[int, dict]:
 
         def rec(n) -> None:
             for c in n.children:
-                if c.type == "field_declaration":
-                    collect_field(c, oline)
+                if c.type in _AL_MEMBER_TYPES:
+                    collect_member(c)
                 elif c.type in ("procedure", "trigger_declaration", "interface_procedure"):
                     pdoc = preceding_doc(c)
                     if pdoc:
