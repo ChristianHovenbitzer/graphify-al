@@ -5164,6 +5164,32 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
         for c in node.children:
             collect_table_relations(c, obj_line)
 
+    def collect_field_enum_types(node) -> None:
+        # An `Enum "<Name>"`-typed field (type_specification > object_reference_type
+        # with an `enum_keyword`) references an enum object. Emit a `typed_as` fact
+        # FROM the field member node (attributed to the field's declaration line so
+        # it resolves to that member, not the table) TO the enum object node. A cheap
+        # mirror of `relates_to`; plain Option-typed fields carry inline members and
+        # name no enum object, so they produce no edge.
+        if node.type == "field_declaration":
+            spec = next((c for c in node.children
+                         if c.type == "type_specification"), None)
+            if spec is not None:
+                objref = next((c for c in spec.children
+                               if c.type == "object_reference_type"), None)
+                if objref is not None and any(
+                        c.type == "enum_keyword" for c in objref.children):
+                    ename = next((c for c in objref.children
+                                  if c.type in ("quoted_identifier", "identifier")),
+                                 None)
+                    if ename is not None:
+                        facts.append({"kind": "typed_as",
+                                      "src_line": node.start_point[0] + 1,
+                                      "target": _al_strip_quotes(text(ename))})
+            return
+        for c in node.children:
+            collect_field_enum_types(c)
+
     def collect_modify_field_validate(node, base_name: str) -> None:
         if node.type == "modify_modification":
             fld = next((text(c) for c in node.children
@@ -5212,6 +5238,7 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                           "target": _al_strip_quotes(text(base))})
         if obj.type in ("table_declaration", "tableextension_declaration"):
             collect_table_relations(obj, obj_line)
+            collect_field_enum_types(obj)
         if obj.type == "tableextension_declaration" and base is not None:
             # `modify(<Field>) { trigger OnValidate() }` extends a field that lives
             # in the BASE table (a different object). Emit a fact linking the
@@ -5584,7 +5611,7 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
     _STUB_TYPE_BY_KIND = {
         "relates_to": "table", "computes_from": "table", "transfers_to": "table",
         "binds": "table", "implements": "interface",
-        "enum_binds_implementation": "codeunit",
+        "enum_binds_implementation": "codeunit", "typed_as": "enum",
     }
 
     _REL = {"extends": "extends", "subscribes": "subscribes",
@@ -5592,10 +5619,11 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
             "relates_to": "relates_to", "computes_from": "computes_from",
             "implements": "implements",
             "enum_binds_implementation": "enum_binds_implementation",
-            "transfers_to": "transfers_to"}
+            "transfers_to": "transfers_to", "typed_as": "typed_as"}
     _EXTRACTED = frozenset({"extends", "subscribes", "binds", "relates_to",
                             "computes_from", "implements",
-                            "enum_binds_implementation", "transfers_to"})
+                            "enum_binds_implementation", "transfers_to",
+                            "typed_as"})
 
     # Interface dispatch fans a call on an `Interface "IFoo"`-typed variable out to
     # every object that `implements "IFoo"`. Pre-index implementor node ids by
