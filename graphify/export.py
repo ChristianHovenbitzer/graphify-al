@@ -471,17 +471,65 @@ def attach_hyperedges(G: nx.Graph, hyperedges: list) -> None:
     G.graph["hyperedges"] = existing
 
 
-def _git_head() -> str | None:
-    """Return the current git HEAD commit hash, or None if not in a git repo."""
+def _git_head(cwd: str | None = None) -> str | None:
+    """Return the git HEAD commit hash of `cwd` (default: process cwd), or None."""
     import subprocess as _sp
     try:
-        r = _sp.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=3)
+        cmd = ["git"] + (["-C", str(cwd)] if cwd else []) + ["rev-parse", "HEAD"]
+        r = _sp.run(cmd, capture_output=True, text=True, timeout=3)
         return r.stdout.strip() if r.returncode == 0 else None
     except Exception:
         return None
 
 
-def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *, force: bool = False, built_at_commit: str | None = None, community_labels: dict[int, str] | None = None) -> bool:
+def source_repo_meta(root: str) -> dict | None:
+    """Provenance of the SCANNED source tree: remote, commit, path prefix, link template.
+
+    Lets every node be turned into a permalink into the hosting repo, so the graph never
+    has to store source text. `source_file` on a node is relative to `root`; `path_prefix`
+    maps it onto the repo root. Pins the SOURCE commit, not the extractor commit.
+    """
+    import subprocess as _sp
+
+    def _git(*args: str) -> str | None:
+        try:
+            r = _sp.run(["git", "-C", str(root), *args], capture_output=True, text=True, timeout=5)
+            return r.stdout.strip() if r.returncode == 0 else None
+        except Exception:
+            return None
+
+    commit = _git("rev-parse", "HEAD")
+    remote = _git("remote", "get-url", "origin")
+    toplevel = _git("rev-parse", "--show-toplevel")
+    if not (commit and toplevel):
+        return None
+
+    prefix = ""
+    try:
+        prefix = str(Path(root).resolve().relative_to(Path(toplevel).resolve())).replace("\\", "/")
+        prefix = "" if prefix == "." else prefix
+    except Exception:
+        prefix = ""
+
+    meta: dict = {
+        "commit": commit,
+        "branch": _git("rev-parse", "--abbrev-ref", "HEAD"),
+        "remote": remote,
+        "path_prefix": prefix,
+    }
+
+    # Azure DevOps deep link: ...?path=/<prefix>/<source_file>&version=GC<commit>&line=<n>
+    if remote and "dev.azure.com" in remote:
+        base = remote[:-4] if remote.endswith(".git") else remote
+        meta["link_template"] = (
+            base + "?path=/{path}&version=GC" + commit
+            + "&line={line}&lineEnd={line_end}&lineStartColumn=1&lineEndColumn=1"
+              "&lineStyle=plain&_a=contents"
+        )
+    return meta
+
+
+def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *, force: bool = False, built_at_commit: str | None = None, community_labels: dict[int, str] | None = None, source_repo: dict | None = None) -> bool:
     # Safety check: refuse to silently shrink an existing graph (#479)
     existing_path = Path(output_path)
     if not force and existing_path.exists():
@@ -536,6 +584,53 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
     commit = built_at_commit if built_at_commit is not None else _git_head()
     if commit:
         data["built_at_commit"] = commit
+    if source_repo:
+        data["source_repo"] = source_repo
+    # Merge function descriptions from the descriptions.json sidecar onto nodes.
+    # `origin` is kept so a generated description is never mistaken for evidence.
+    try:
+        # The sidecar lives NEXT TO the repo (graphify-out is wiped on rebuild);
+        # fall back to the output directory for older layouts.
+        _out = Path(output_path).parent
+        _side = _out.parent / "descriptions.json"
+        if not _side.exists():
+            _side = _out / "descriptions.json"
+        if _side.exists():
+            _desc = json.loads(_side.read_text(encoding="utf-8"))
+            _hit = 0
+            for _n in data.get("nodes", []):
+                _d = _desc.get(_n.get("id"))
+                if isinstance(_d, dict) and _d.get("description"):
+                    _n["description"] = _d["description"]
+                    _n["description_origin"] = _d.get("origin", "generated")
+                    if _d.get("confidence"):
+                        _n["description_confidence"] = _d["confidence"]
+                    _hit += 1
+            if _hit:
+                data["descriptions_applied"] = _hit
+    except Exception:
+        pass
+    # Merge localized captions/tooltips/messages from the translations.json sidecar
+    # (caption_de / tooltip_de / messages_de + state), so search and quoting work in the
+    # end user's language without reading the .xlf at query time.
+    try:
+        _t = Path(output_path).parent.parent / "translations.json"
+        if not _t.exists():
+            _t = Path(output_path).parent / "translations.json"
+        if _t.exists():
+            _tr = json.loads(_t.read_text(encoding="utf-8"))
+            _n2 = 0
+            for _n in data.get("nodes", []):
+                _d = _tr.get(_n.get("id"))
+                if isinstance(_d, dict):
+                    for _k, _v in _d.items():
+                        if _v:
+                            _n[_k] = _v
+                    _n2 += 1
+            if _n2:
+                data["translations_applied"] = _n2
+    except Exception:
+        pass
     with open(output_path, "w", encoding="utf-8") as f:  # nosec
         json.dump(data, f, indent=2)
     return True

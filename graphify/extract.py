@@ -5205,6 +5205,78 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
             return None  # first real arg is not an object -> can't resolve statically
         return None
 
+    # Field access of a procedure: `Cust."No."` / `Rec.Amount` -> edge from the
+    # procedure to the field node of the declared table. Record-typed variables only
+    # (incl. Rec/xRec via obj_vars), so codeunit/page members add no noise.
+    _AL_FIELD_SKIP = {
+        "get", "find", "findset", "findfirst", "findlast", "next", "insert", "modify",
+        "delete", "deleteall", "modifyall", "init", "reset", "setrange", "setfilter",
+        "setcurrentkey", "setascending", "setloadfields", "calcfields", "calcsums",
+        "testfield", "validate", "isempty", "count", "copy", "readisolation",
+        "setrecfilter", "getfilter", "getfilters", "sethidevalidationdialog",
+        "fieldno", "recordid", "systemid", "transferfields", "setautocalcfields",
+        "getrecordonce", "changecompany", "lockTable".lower(), "ascending",
+    }
+
+    def walk_field_access(node, proc_line: int, varmap: dict, write_ids=None) -> None:
+        """Collect a procedure's field accesses as facts.
+
+        Writing in AL is (a) `Rec.Field := X` and (b) `Rec.Validate(Field, X)`.
+        `SetRange`/`SetFilter` FILTER, they do not write - they stay out via
+        _AL_FIELD_SKIP. Note `assignment_statement` has no `left` field in
+        tree-sitter-al: the first named child is the target.
+        """
+        if write_ids is None:
+            write_ids = set()
+
+        if node.type == "assignment_statement":
+            for c in node.children:
+                if c.is_named:
+                    write_ids.add(id(c))
+                    break
+
+        # Rec.Validate(Feld, ...) -> Schreibzugriff auf Feld
+        if node.type == "call_expression":
+            fn = node.child_by_field_name("function")
+            if fn is not None and fn.type == "member_expression":
+                ob = fn.child_by_field_name("object")
+                mem = fn.child_by_field_name("member")
+                if (ob is not None and mem is not None and ob.type == "identifier"
+                        and text(mem).lower() == "validate"):
+                    decl = varmap.get(text(ob).lower())
+                    if decl and decl[0] == "record":
+                        args = fn.parent.child_by_field_name("arguments")
+                        if args is None:
+                            args = next((c for c in node.children
+                                         if c.type == "argument_list"), None)
+                        if args is not None:
+                            first = next((a for a in args.children
+                                          if a.type in ("identifier", "quoted_identifier")), None)
+                            if first is not None:
+                                fname = _al_strip_quotes(text(first))
+                                if fname:
+                                    facts.append({
+                                        "kind": "accesses_field", "src_line": proc_line,
+                                        "target": decl[1], "field": fname, "mode": "write",
+                                    })
+
+        if node.type == "member_expression":
+            ob = node.child_by_field_name("object")
+            mem = node.child_by_field_name("member")
+            if ob is not None and mem is not None and ob.type == "identifier":
+                decl = varmap.get(text(ob).lower())
+                if decl and decl[0] == "record":
+                    fname = _al_strip_quotes(text(mem))
+                    if fname and fname.lower() not in _AL_FIELD_SKIP:
+                        facts.append({
+                            "kind": "accesses_field", "src_line": proc_line,
+                            "target": decl[1], "field": fname,
+                            "mode": "write" if id(node) in write_ids else "read",
+                        })
+
+        for c in node.children:
+            walk_field_access(c, proc_line, varmap, write_ids)
+
     def walk_calls(node, proc_line: int, varmap: dict, usercontrols: dict) -> None:
         if node.type == "call_expression":
             fn = node.child_by_field_name("function")
@@ -5782,6 +5854,7 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
             collect_usercontrols(body)
 
         pending: list[str] = []
+        _seen_trigger_lines: set = set()
         for c in body.children:
             if c.type == "attribute_item":
                 pending.append(text(c))
@@ -5804,7 +5877,38 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                 pbody = c.child_by_field_name("body")
                 if pbody is not None:
                     walk_calls(pbody, proc_line, vm, usercontrols)
+                    walk_field_access(pbody, proc_line, vm)
+                    _seen_trigger_lines.add(proc_line)
             pending = []
+
+        # NESTED triggers. The loop above only sees direct children of the object
+        # body, i.e. object-wide triggers (OnRun, OnInsert, OnOpenPage). `OnAction`
+        # sits in actions{area{action{trigger}}} and `OnValidate` in
+        # fields{field{trigger}} - neither was ever walked, which is why actions and
+        # field validations carried no call or field-access edges.
+        def walk_nested_triggers(n, scope_vars: dict) -> None:
+            vars_here = scope_vars
+            if n.type in ("procedure", "trigger_declaration", "interface_procedure"):
+                tline = line(n)
+                if tline in _seen_trigger_lines:
+                    return
+                _seen_trigger_lines.add(tline)
+                vm2 = dict(scope_vars)
+                for pc in n.children:
+                    if pc.type in ("parameter_list", "var_section"):
+                        collect_vars(pc, vm2)
+                tbody = n.child_by_field_name("body")
+                if tbody is not None:
+                    walk_calls(tbody, tline, vm2, usercontrols)
+                    walk_field_access(tbody, tline, vm2)
+                return
+            if n.type == "var_section":
+                vars_here = dict(scope_vars)
+                collect_vars(n, vars_here)
+            for ch in n.children:
+                walk_nested_triggers(ch, vars_here)
+
+        walk_nested_triggers(body, obj_vars)
 
         if _AL_EMIT_USES:
             for _cls, name in uses:
@@ -6034,11 +6138,11 @@ _AL_OBJECT_PROP_ATTRS = {
 
 
 def _al_trigger_kind(name: str) -> str:
-    """Classify an AL trigger name into a coarse marker (#39).
+    """Classify an AL trigger name (#39).
 
-    `OnRun` is the runnable entrypoint; install/upgrade triggers drive the
-    Install/Upgrade lifecycle. Everything else (page/table/field triggers such
-    as OnValidate, OnOpenPage, OnAfterGetRecord) is `other`.
+    Previously 44 of 49 triggers in a real app fell into `other`, so "which field
+    validations exist" / "what happens when this page opens" was not answerable even
+    though the trigger name carries the answer.
     """
     low = name.lower()
     if low == "onrun":
@@ -6047,6 +6151,36 @@ def _al_trigger_kind(name: str) -> str:
         return "install"
     if low.startswith("onupgrade"):
         return "upgrade"
+    # field / record validation
+    if low in ("onvalidate",):
+        return "field_validate"
+    if low in ("onlookup",):
+        return "field_lookup"
+    if low in ("ondrilldown",):
+        return "field_drilldown"
+    if low in ("onaction",):
+        return "action"
+    # table lifecycle
+    if low in ("oninsert", "onmodify", "ondelete", "onrename"):
+        return "record_" + low[2:]
+    # page lifecycle and navigation
+    if low in ("oninit", "onopenpage", "onclosepage", "onquueryclosepage",
+               "onqueryclosepage"):
+        return "page_lifecycle"
+    if low in ("onaftergetrecord", "onaftergetcurrrecord", "onnewrecord",
+               "oninsertrecord", "onmodifyrecord", "ondeleterecord",
+               "onbeforeinsertrecord", "onbeforemodifyrecord",
+               "onbeforedeleterecord", "onafterinsertrecord",
+               "onaftermodifyrecord", "onafterdeleterecord", "onfindrecord",
+               "onnextrecord"):
+        return "page_record"
+    # reports and XMLports
+    if low.startswith("onpre") or low.startswith("onpost"):
+        return "report_lifecycle"
+    if low.startswith("onafterget") or low.startswith("onbeforeget"):
+        return "page_record"
+    if low.startswith("oncontroladdin") or low in ("controladdinready",):
+        return "controladdin"
     return "other"
 
 
@@ -6256,6 +6390,7 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
     _STUB_TYPE_BY_KIND = {
         "relates_to": "table", "computes_from": "table", "transfers_to": "table",
         "binds": "table", "implements": "interface",
+        "accesses_field": "table",
         "enum_binds_implementation": "codeunit", "typed_as": "enum",
         "sub_page": "page", "rolecenter": "page",
         "usercontrol": "controladdin",
@@ -6278,12 +6413,13 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
             "transfers_to": "transfers_to", "typed_as": "typed_as",
             "grants": "grants", "sub_page": "subpage",
             "navigates_to": "navigates_to", "rolecenter": "rolecenter",
-            "usercontrol": "usercontrol"}
+            "usercontrol": "usercontrol",
+            "accesses_field": "accesses_field"}
     _EXTRACTED = frozenset({"extends", "subscribes", "binds", "relates_to",
                             "computes_from", "implements",
                             "enum_binds_implementation", "transfers_to",
                             "typed_as", "grants", "sub_page", "navigates_to",
-                            "rolecenter", "usercontrol"})
+                            "rolecenter", "usercontrol", "accesses_field"})
 
     # Interface dispatch fans a call on an `Interface "IFoo"`-typed variable out to
     # every object that `implements "IFoo"`. Pre-index implementor node ids by
@@ -6412,6 +6548,26 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
                             new_edges.append({
                                 "source": src, "target": tgt, "relation": "references",
                                 "context": "al_column_source", "confidence": "EXTRACTED",
+                                "confidence_score": 0.9, "source_file": sf,
+                                "source_location": f"L{f.get('src_line', '')}", "weight": 1.0,
+                            })
+                continue
+            if f["kind"] == "accesses_field":
+                # procedure -> field of the declared table
+                src = line2nid.get(f.get("src_line"))
+                tname = f.get("target")
+                fld = f.get("field")
+                if src and tname and fld:
+                    tgt = resolve_field(tname, fld)
+                    if src != tgt:
+                        mode = f.get("mode", "read")
+                        pair = (src, tgt, "accesses_field", mode)
+                        if pair not in seen:
+                            seen.add(pair)
+                            new_edges.append({
+                                "source": src, "target": tgt, "relation": "accesses_field",
+                                "mode": mode,
+                                "context": f"al_field_{mode}", "confidence": "EXTRACTED",
                                 "confidence_score": 0.9, "source_file": sf,
                                 "source_location": f"L{f.get('src_line', '')}", "weight": 1.0,
                             })

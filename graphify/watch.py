@@ -177,11 +177,12 @@ def _apply_resource_limits() -> None:
         pass
 
 
-def _git_head() -> str | None:
-    """Return current git HEAD commit hash, or None outside a repo."""
+def _git_head(cwd: str | None = None) -> str | None:
+    """Return git HEAD commit hash of `cwd` (default: process cwd), or None outside a repo."""
     import subprocess as _sp
     try:
-        r = _sp.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=3)
+        cmd = ["git"] + (["-C", str(cwd)] if cwd else []) + ["rev-parse", "HEAD"]
+        r = _sp.run(cmd, capture_output=True, text=True, timeout=3)
         return r.stdout.strip() if r.returncode == 0 else None
     except Exception:
         return None
@@ -488,7 +489,7 @@ def _rebuild_code(
         from graphify.cluster import cluster, remap_communities_to_previous, score_all
         from graphify.analyze import god_nodes, surprising_connections, suggest_questions
         from graphify.report import generate
-        from graphify.export import to_json, to_html
+        from graphify.export import to_json, to_html, source_repo_meta
         from graphify.security import check_graph_file_size_cap
 
         detected = detect(watch_path, follow_symlinks=follow_symlinks)
@@ -556,7 +557,8 @@ def _rebuild_code(
         else:
             extract_targets = code_files
 
-        commit = _git_head()
+        commit = _git_head(watch_root)
+        _src_repo = source_repo_meta(str(watch_root))
         result = extract(extract_targets, cache_root=watch_root) if extract_targets else {
             "nodes": [], "edges": [], "hyperedges": [],
             "input_tokens": 0, "output_tokens": 0,
@@ -748,7 +750,8 @@ def _rebuild_code(
         report_path = out / "GRAPH_REPORT.md"
         labels_json = json.dumps({str(k): v for k, v in sorted(labels.items())}, ensure_ascii=False, indent=2) + "\n"
         graph_tmp = out / ".graph.tmp.json"
-        json_written = to_json(G, communities, str(graph_tmp), force=True, built_at_commit=commit)
+        json_written = to_json(G, communities, str(graph_tmp), force=True, built_at_commit=commit,
+                               source_repo=_src_repo)
         if not json_written:
             return False
         candidate_graph_data = json.loads(graph_tmp.read_text(encoding="utf-8"))
