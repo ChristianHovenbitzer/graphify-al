@@ -400,6 +400,7 @@ def _rebuild_code(
     follow_symlinks: bool = False,
     force: bool = False,
     no_cluster: bool = False,
+    no_report: bool = False,
     acquire_lock: bool = True,
     block_on_lock: bool = False,
 ) -> bool:
@@ -423,6 +424,18 @@ def _rebuild_code(
 
     ``no_cluster`` skips community detection and writes raw merged extraction
     JSON to graphify-out/graph.json (mirrors ``extract --no-cluster``).
+
+    ``no_report`` skips ``score_all``/``god_nodes``/``surprising_connections``/
+    ``suggest_questions``/``generate`` (GRAPH_REPORT.md and .graphify_labels.json
+    are left untouched) -- none of it feeds graph.json (``to_json`` only takes
+    ``G``/``communities``) or any served MCP tool, which recompute god-nodes/
+    surprising-connections live from the graph on query instead of reading
+    build-time output (bcatlas/serve.py). ``suggest_questions`` alone runs a
+    full-graph ``betweenness_centrality`` -- measured live (bc-code-atlas
+    incremental-build profiling) at ~30% of this function's total wall-clock
+    on a 267K-node graph, for a report section nothing reads programmatically.
+    Community detection itself (``cluster``) still runs -- graph.json's
+    community IDs depend on it.
 
     Returns True on success, False on error or skipped-due-to-lock.
     """
@@ -457,6 +470,7 @@ def _rebuild_code(
                 follow_symlinks=follow_symlinks,
                 force=force,
                 no_cluster=no_cluster,
+                no_report=no_report,
                 acquire_lock=False,
             )
             # Late-arrival drain: another hook may have queued work while we
@@ -474,6 +488,7 @@ def _rebuild_code(
                         follow_symlinks=follow_symlinks,
                         force=force,
                         no_cluster=no_cluster,
+                        no_report=no_report,
                         acquire_lock=False,
                     ) and ok
             return ok
@@ -728,9 +743,6 @@ def _rebuild_code(
         previous_node_community = _node_community_map(existing_graph_data)
         if previous_node_community:
             communities = remap_communities_to_previous(communities, previous_node_community)
-        cohesion = score_all(G, communities)
-        gods = god_nodes(G)
-        surprises = surprising_connections(G, communities)
         labels_file = out / ".graphify_labels.json"
         try:
             raw = json.loads(labels_file.read_text(encoding="utf-8")) if labels_file.exists() else {}
@@ -741,10 +753,25 @@ def _rebuild_code(
         for cid in communities:
             if cid not in labels:
                 labels[cid] = "Community " + str(cid)
-        questions = suggest_questions(G, communities, labels)
-        report = generate(G, communities, cohesion, labels, gods, surprises, detection,
-                          {"input": 0, "output": 0}, report_root, suggested_questions=questions,
-                          built_at_commit=commit)
+        # score_all/god_nodes/surprising_connections/suggest_questions/generate
+        # only feed GRAPH_REPORT.md -- to_json below takes just G/communities,
+        # and the equivalent served MCP tools (bcatlas_god_nodes, the
+        # graphify://surprises resource) recompute live from the graph on
+        # query rather than reading this build-time output (see serve.py).
+        # suggest_questions's full-graph betweenness_centrality alone measured
+        # ~30% of this function's total wall-clock on a 267K-node graph, so
+        # no_report (the automated build pipeline's default) skips all of it
+        # and leaves GRAPH_REPORT.md/.graphify_labels.json untouched instead
+        # of paying that cost for a report section nothing programmatic reads.
+        report: str | None = None
+        if not no_report:
+            cohesion = score_all(G, communities)
+            gods = god_nodes(G)
+            surprises = surprising_connections(G, communities)
+            questions = suggest_questions(G, communities, labels)
+            report = generate(G, communities, cohesion, labels, gods, surprises, detection,
+                              {"input": 0, "output": 0}, report_root, suggested_questions=questions,
+                              built_at_commit=commit)
         report_path = out / "GRAPH_REPORT.md"
         labels_json = json.dumps({str(k): v for k, v in sorted(labels.items())}, ensure_ascii=False, indent=2) + "\n"
         graph_tmp = out / ".graph.tmp.json"
@@ -753,7 +780,11 @@ def _rebuild_code(
             return False
         candidate_graph_data = json.loads(graph_tmp.read_text(encoding="utf-8"))
         same_graph = False
-        same_report = False
+        # no_report has no fresh report to compare -- treat the report as
+        # unchanged so `no_change` below is governed by the graph alone, and
+        # the write branch's `report is not None` guard leaves the stale
+        # GRAPH_REPORT.md/.graphify_labels.json on disk untouched.
+        same_report = True
         if existing_graph.exists():
             try:
                 check_graph_file_size_cap(existing_graph)
@@ -764,7 +795,7 @@ def _rebuild_code(
                 )
             except Exception:
                 same_graph = False
-        if report_path.exists():
+        if report is not None and report_path.exists():
             old_report = report_path.read_text(encoding="utf-8")
             same_report = _report_for_compare(old_report) == _report_for_compare(report)
         no_change = same_graph and same_report
@@ -781,8 +812,9 @@ def _rebuild_code(
             from graphify.export import backup_if_protected as _backup
             _backup(out)
             graph_tmp.replace(existing_graph)
-            report_path.write_text(report, encoding="utf-8")
-            labels_file.write_text(labels_json, encoding="utf-8")
+            if report is not None:
+                report_path.write_text(report, encoding="utf-8")
+                labels_file.write_text(labels_json, encoding="utf-8")
 
         try:
             from graphify.detect import save_manifest

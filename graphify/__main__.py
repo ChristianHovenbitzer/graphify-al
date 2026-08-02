@@ -3326,6 +3326,7 @@ def main() -> None:
     elif cmd == "update":
         force = os.environ.get("GRAPHIFY_FORCE", "").lower() in ("1", "true", "yes")
         no_cluster = False
+        no_report = False
         changed_paths_file: str | None = None
         args = sys.argv[2:]
         watch_arg: str | None = None
@@ -3338,6 +3339,10 @@ def main() -> None:
                 continue
             if a == "--no-cluster":
                 no_cluster = True
+                i += 1
+                continue
+            if a == "--no-report":
+                no_report = True
                 i += 1
                 continue
             if a == "--changed-paths-file":
@@ -3397,6 +3402,7 @@ def main() -> None:
             changed_paths=changed_paths,
             force=force,
             no_cluster=no_cluster,
+            no_report=no_report,
             block_on_lock=True,
         )
         if ok:
