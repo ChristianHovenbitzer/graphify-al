@@ -756,7 +756,30 @@ def _rank_scores(
     return _score_nodes(G, ranking_terms)
 
 
-def _find_node(G: nx.Graph, label: str) -> list[str]:
+class _NodeMatches(list):
+    """A `list[str]` (every existing caller's `matches[0]`/`if not matches`/
+    iteration keeps working unchanged) that additionally exposes how many
+    of the leading entries tied for the BEST match tier, via
+    `.top_tier_count`.
+
+    Needed for FR-005 (spec 004-al-object-labels): a query matching more
+    than one node in its best-matching tier is genuinely ambiguous (e.g. a
+    table and a page both named "Item") and callers that care should say
+    so, rather than silently taking `matches[0]`. This must be the *best*
+    tier, not always the exact tier specifically: since object labels now
+    carry type/ID tokens (spec 004), a bare-name query like "item" no
+    longer lands in the exact tier for either candidate (their full labels
+    are "Table 27 \"Item\"" / "Page 30 \"Item\"") -- both instead tie in the
+    substring tier, which is exactly where this ambiguity must still be
+    caught. A single top-tier match with additional looser matches behind
+    it in a lower tier is NOT ambiguous -- `top_tier_count` only counts
+    ties within whichever tier is actually winning.
+    """
+
+    top_tier_count: int = 0
+
+
+def _find_node(G: nx.Graph, label: str) -> _NodeMatches:
     """Return node IDs whose label or ID matches the search term (diacritic-insensitive).
 
     Results are ordered by three-tier precedence: exact match, then prefix match,
@@ -764,7 +787,7 @@ def _find_node(G: nx.Graph, label: str) -> list[str]:
     """
     term = " ".join(_search_tokens(label))
     if not term:
-        return []
+        return _NodeMatches()
     exact: list[str] = []
     prefix: list[str] = []
     substring: list[str] = []
@@ -784,7 +807,9 @@ def _find_node(G: nx.Graph, label: str) -> list[str]:
             prefix.append(nid)
         elif term in norm_label or term in label_tokens:
             substring.append(nid)
-    return exact + prefix + substring
+    result = _NodeMatches(exact + prefix + substring)
+    result.top_tier_count = len(exact) or len(prefix) or len(substring)
+    return result
 
 
 def _filter_blank_stdin() -> None:
@@ -1151,17 +1176,35 @@ def _build_server(
         )
         return result
 
+    def _ambiguity_message(G: nx.Graph, matches: _NodeMatches) -> str:
+        # FR-005 (spec 004-al-object-labels): a query matching more than one
+        # node in the EXACT tier is genuinely ambiguous (e.g. a table and a
+        # page both named "Item") -- list the candidates by their full
+        # (now type+ID-qualified) label so the caller can retry
+        # unambiguously, rather than silently taking matches[0].
+        candidates = "\n".join(
+            f"  - {sanitize_label(G.nodes[nid].get('label', nid))}"
+            for nid in matches[: matches.top_tier_count]
+        )
+        return (
+            f"Multiple objects match:\n{candidates}\n"
+            "Retry with the full object reference (e.g. the exact label "
+            "shown above) to disambiguate."
+        )
+
     def _tool_get_node(arguments: dict) -> str:
         try:
             ctx = _resolve_ctx(arguments)
         except _RoutingError as exc:
             return str(exc)
         label = arguments["label"].lower()
-        matches = [(nid, d) for nid, d in ctx.G.nodes(data=True)
-                   if label in (d.get("label") or "").lower() or label == nid.lower()]
+        matches = _find_node(ctx.G, label)
         if not matches:
             return f"No node matching '{label}' found."
-        nid, d = matches[0]
+        if matches.top_tier_count > 1:
+            return _ambiguity_message(ctx.G, matches)
+        nid = matches[0]
+        d = ctx.G.nodes[nid]
         # Sanitise every LLM-derived field before concatenation (F-010).
         return "\n".join([
             f"Node: {sanitize_label(d.get('label', nid))}",
@@ -1183,6 +1226,8 @@ def _build_server(
         matches = _find_node(G, label)
         if not matches:
             return f"No node matching '{label}' found."
+        if matches.top_tier_count > 1:
+            return _ambiguity_message(G, matches)
         nid = matches[0]
         lines = [f"Neighbors of {sanitize_label(G.nodes[nid].get('label', nid))}:"]
         for nb in G.successors(nid):
@@ -1209,6 +1254,8 @@ def _build_server(
         matches = _find_node(ctx.G, label.lower())
         if not matches:
             return f"No node matching '{label}' found."
+        if matches.top_tier_count > 1:
+            return _ambiguity_message(ctx.G, matches)
         nid = matches[0]
         d = ctx.G.nodes[nid]
         source_file = d.get("source_file") or ""
