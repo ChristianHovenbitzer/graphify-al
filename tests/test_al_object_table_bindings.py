@@ -18,7 +18,15 @@ def _binds(edges):
 
 
 def _node_by_label(nodes, label):
-    return next(n for n in nodes if str(n.get("label", "")).strip('"') == label)
+    # Real object nodes carry the bare name separately in `al_object_name`
+    # (`label` is now the full type+ID+name canonical reference, spec
+    # 004-al-object-labels) -- prefer that, falling back to the old
+    # strip('"') match for non-object nodes.
+    return next(
+        n for n in nodes
+        if n.get("al_object_name") == label
+        or str(n.get("label", "")).strip('"') == label
+    )
 
 
 def test_page_sourcetable_binds_to_in_corpus_table(tmp_path):

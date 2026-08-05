@@ -96,7 +96,7 @@ def test_navigation_edges_resolve_to_member_and_target_nodes(tmp_path):
 
     action_nid = next(n["id"] for n in result["nodes"] if n["label"] == ".Entries")
     entries_obj = next(n["id"] for n in result["nodes"]
-                       if n["label"] == '"My Order Entries"')
+                       if n["label"] == 'Page 50101 "My Order Entries"')
     no_field = next(n["id"] for n in result["nodes"] if n["label"] == '."No."')
 
     nav = [e for e in result["edges"] if e["relation"] == "navigates_to"]

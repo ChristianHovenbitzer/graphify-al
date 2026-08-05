@@ -218,7 +218,7 @@ def test_blank_enum_value_gets_distinct_node_no_self_loop(tmp_path):
     p.write_text(_ENUM, encoding="utf-8")
     result = extract_al(p)
 
-    enum = _member(result, '"Widget State"')
+    enum = _member(result, 'Enum 50103 "Widget State"')
     contains = [(e["source"], e["target"]) for e in result["edges"]
                 if e["relation"] == "contains"]
 
@@ -246,7 +246,7 @@ def test_two_members_normalizing_equal_do_not_merge(tmp_path):
     p.write_text(src, encoding="utf-8")
     result = extract_al(p)
 
-    table = _member(result, '"Widget Coll"')
+    table = _member(result, 'Table 50104 "Widget Coll"')
     members = [t for (s, t) in
                [(e["source"], e["target"]) for e in result["edges"]
                 if e["relation"] == "contains"]
@@ -276,7 +276,7 @@ def test_tableextension_object_does_not_inherit_field_caption(tmp_path):
     p.write_text(_TABLEEXT, encoding="utf-8")
     result = extract_al(p)
 
-    obj = _member(result, '"Widget Ext"')
+    obj = _member(result, 'TableExtension 50105 "Widget Ext"')
     field = _member(result, '."Widget Code"')
 
     # Object node (which has no own Caption) must NOT adopt the field's caption.

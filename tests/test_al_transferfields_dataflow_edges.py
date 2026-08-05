@@ -50,9 +50,9 @@ def test_transfers_to_var_declared_source_and_dest(tmp_path):
 
     result = extract([src_tbl, dst_tbl, cu], cache_root=tmp_path)
 
-    src_id = next(n["id"] for n in result["nodes"] if n["label"] == '"Sales Header"')
+    src_id = next(n["id"] for n in result["nodes"] if n["label"] == 'Table 50100 "Sales Header"')
     dst_id = next(n["id"] for n in result["nodes"]
-                  if n["label"] == '"Sales Shipment Header"')
+                  if n["label"] == 'Table 50101 "Sales Shipment Header"')
 
     xfer = _xfer_edges(result)
     assert len(xfer) == 1
@@ -92,9 +92,9 @@ def test_transfers_to_parameter_typed_records(tmp_path):
 
     result = extract([src_tbl, dst_tbl, cu], cache_root=tmp_path)
 
-    src_id = next(n["id"] for n in result["nodes"] if n["label"] == '"Sales Header"')
+    src_id = next(n["id"] for n in result["nodes"] if n["label"] == 'Table 50100 "Sales Header"')
     dst_id = next(n["id"] for n in result["nodes"]
-                  if n["label"] == '"Sales Shipment Header"')
+                  if n["label"] == 'Table 50101 "Sales Shipment Header"')
 
     xfer = _xfer_edges(result)
     assert len(xfer) == 1

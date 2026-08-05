@@ -19,7 +19,16 @@ from graphify.extract import extract
 
 
 def _node_by_label(nodes, label):
-    return next(n for n in nodes if str(n.get("label", "")).strip('"') == label)
+    # Real AL object nodes now carry the bare name separately in
+    # `al_object_name` (their `label` is the full type+ID+name canonical
+    # reference, spec 004-al-object-labels) -- prefer that, falling back to
+    # the old strip('"') match for non-object nodes (e.g. member/procedure
+    # nodes, which are unaffected by that change).
+    return next(
+        n for n in nodes
+        if n.get("al_object_name") == label
+        or str(n.get("label", "")).strip('"') == label
+    )
 
 
 def _addin_and_page(tmp_path):

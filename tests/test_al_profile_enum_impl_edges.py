@@ -64,7 +64,7 @@ def test_profile_rolecenter_edge(tmp_path: Path):
 
     rc_edges = _edge_labels(result, ("rolecenter",))
     # quoted-identifier objects keep their quotes in the node label.
-    assert ('"Sales Agent"', "rolecenter", '"Sales Manager Role Center"') in rc_edges
+    assert ('Profile "Sales Agent"', "rolecenter", 'Page 50210 "Sales Manager Role Center"') in rc_edges
 
 
 def test_enum_object_level_default_and_unknown_implementation_edges(tmp_path: Path):
@@ -76,11 +76,11 @@ def test_enum_object_level_default_and_unknown_implementation_edges(tmp_path: Pa
 
     # object-level DefaultImplementation / UnknownValueImplementation anchor on
     # the enum object itself.
-    assert ("Pay", "enum_binds_implementation", "DefaultPay") in bind_edges
-    assert ("Pay", "enum_binds_implementation", "FallbackPay") in bind_edges
+    assert ('Enum 50203 "Pay"', "enum_binds_implementation", 'Codeunit 50200 "DefaultPay"') in bind_edges
+    assert ('Enum 50203 "Pay"', "enum_binds_implementation", 'Codeunit 50201 "FallbackPay"') in bind_edges
     # each bound impl implements the interface.
-    assert ("DefaultPay", "implements", "IPay") in impl_edges
-    assert ("FallbackPay", "implements", "IPay") in impl_edges
+    assert ('Codeunit 50200 "DefaultPay"', "implements", 'Interface "IPay"') in impl_edges
+    assert ('Codeunit 50201 "FallbackPay"', "implements", 'Interface "IPay"') in impl_edges
 
 
 def test_enum_value_level_implementation_anchors_on_value_node(tmp_path: Path):
@@ -90,7 +90,7 @@ def test_enum_value_level_implementation_anchors_on_value_node(tmp_path: Path):
     bind_edges = _edge_labels(result, ("enum_binds_implementation",))
     # value-level Implementation anchors on the enum VALUE node (".Card"), not the
     # enum object.
-    assert (".Card", "enum_binds_implementation", "CardPay") in bind_edges
+    assert (".Card", "enum_binds_implementation", 'Codeunit 50202 "CardPay"') in bind_edges
     assert ("Pay", "enum_binds_implementation", "CardPay") not in bind_edges
 
 
