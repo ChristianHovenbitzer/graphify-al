@@ -2281,6 +2281,34 @@ _AL_CONFIG = LanguageConfig(
     import_handler=_import_al,
 )
 
+# Display word for each AL object declaration kind, used to build the
+# canonical `{Type} {Id} "{Name}"` node label (spec 004-al-object-labels,
+# constitution Principle VI fix against upstream commit 05cbe56). Explicit
+# map rather than `.capitalize()` so multi-word kinds render legibly
+# (`"tableextension".capitalize()` -> "Tableextension", not "TableExtension").
+# Covers every entry in `_AL_CONFIG.class_types` above.
+_AL_TYPE_DISPLAY: dict[str, str] = {
+    "codeunit": "Codeunit",
+    "table": "Table",
+    "page": "Page",
+    "report": "Report",
+    "query": "Query",
+    "xmlport": "XmlPort",
+    "enum": "Enum",
+    "interface": "Interface",
+    "controladdin": "ControlAddIn",
+    "permissionset": "PermissionSet",
+    "permissionsetextension": "PermissionSetExtension",
+    "profile": "Profile",
+    "profileextension": "ProfileExtension",
+    "pageextension": "PageExtension",
+    "tableextension": "TableExtension",
+    "reportextension": "ReportExtension",
+    "enumextension": "EnumExtension",
+    "entitlement": "Entitlement",
+    "dotnet": "DotNet",
+}
+
 
 # AL "member" container nodes: object members that own their own triggers,
 # captions and (for dataitems/elements) nested members. Each is nested BELOW an
@@ -5843,10 +5871,14 @@ def _al_parse_doc(comments: list[str]) -> str:
 
 
 def _al_collect_object_identity(tree, source: bytes):
-    """(file_namespace, {decl_line: (object_type, object_name)}) for #27 global ids.
+    """(file_namespace, {decl_line: (object_type, object_name, object_id)}) for
+    #27 global ids and label correction (#label-type-id).
 
     `object_type` is the declaration kind (table/page/codeunit/tableextension/...);
-    `object_name` is the declared (unquoted) name. Keyed by the object's
+    `object_name` is the declared (unquoted) name; `object_id` is the declared
+    numeric ID as a string, or `None` for object kinds that don't have one
+    (interface, controladdin -- confirmed via the real grammar: only some
+    class_types expose an `object_id` field at all). Keyed by the object's
     declaration line so it can be matched onto the graph node on that line.
     """
     def text(n) -> str:
@@ -5873,7 +5905,12 @@ def _al_collect_object_identity(tree, source: bytes):
                         break
             if name_node is not None:
                 obj_type = n.type[:-len("_declaration")] if n.type.endswith("_declaration") else n.type
-                by_line.setdefault(n.start_point[0] + 1, (obj_type, _al_strip_quotes(text(name_node))))
+                id_node = n.child_by_field_name("object_id")
+                obj_id = text(id_node).strip() if id_node is not None else None
+                by_line.setdefault(
+                    n.start_point[0] + 1,
+                    (obj_type, _al_strip_quotes(text(name_node)), obj_id),
+                )
             return
         for c in n.children:
             find_objs(c)
@@ -6189,7 +6226,13 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
         if lbl.endswith(".al") or lbl.startswith("."):
             continue  # file node / procedure node
         objnodes.append(n)
-        key = _al_strip_quotes(lbl).lower()
+        # Real object nodes carry the authoritative bare name separately
+        # (`al_object_name`, #label-type-id) since `label` is now the full
+        # type+ID+name canonical reference, not the bare name `_al_strip_quotes`
+        # was designed to recover. External stub nodes (`ensure_external` below)
+        # never go through that per-file pass, so they have no `al_object_name`
+        # and correctly fall back to their own (still bare) label.
+        key = (n.get("al_object_name") or _al_strip_quotes(lbl)).lower()
         obj_by_name.setdefault(key, n["id"])
         obj_ids_by_name.setdefault(key, []).append(n["id"])
 
@@ -6595,11 +6638,28 @@ def extract_al(path: Path) -> dict:
             ident = ident_by_line.get(ln)
             if not ident:
                 continue
-            obj_type, obj_name = ident
+            obj_type, obj_name, obj_id = ident
             n.setdefault("al_object_type", obj_type)
+            # Bare name, kept separately from the now type/ID-qualified `label`
+            # (#label-type-id) -- this is the authoritative key
+            # `_resolve_al_facts` must use for cross-file name-based resolution,
+            # since al_facts (extends/implements/TableRelation/... targets) are
+            # always bare names, never the full canonical reference.
+            n.setdefault("al_object_name", obj_name)
             if namespace:
                 n.setdefault("al_namespace", namespace)
             n.setdefault("global_id", _al_make_global_id(obj_type, obj_name, qualifier))
+            # #label-type-id: the node's display label now carries the object's
+            # full canonical AL reference (type + ID + name) instead of just the
+            # bare name -- see spec 004-al-object-labels. This is an intentional
+            # overwrite (not setdefault) of what the generic extractor set,
+            # correcting it now that AL-specific identity is resolved. Node IDs
+            # and edges (computed earlier, from the bare name) are untouched.
+            n["label"] = (
+                f'{_AL_TYPE_DISPLAY.get(obj_type, obj_type.capitalize())} {obj_id} "{obj_name}"'
+                if obj_id
+                else f'{_AL_TYPE_DISPLAY.get(obj_type, obj_type.capitalize())} "{obj_name}"'
+            )
         # Additively attach human-facing text (Caption/ToolTip/Label/XML-doc)
         # onto the object/procedure node sitting on each source line.
         text_by_line = _al_collect_node_text(tree, src)

@@ -50,7 +50,7 @@ def test_table_fields_are_first_class_nodes(tmp_path):
     result = _extract(tmp_path)
     nodes = _by_label(result)
 
-    table = nodes['"Widget"']
+    table = nodes['Table 50100 "Widget"']
     assert nodes['."No."']["source_file"] == table["source_file"]
     assert nodes[".Name"]["source_file"] == table["source_file"]
 
@@ -67,7 +67,7 @@ def test_enum_values_are_first_class_nodes(tmp_path):
     result = _extract(tmp_path)
     nodes = _by_label(result)
 
-    enum = nodes['"Widget Type"']
+    enum = nodes['Enum 50101 "Widget Type"']
     contains = _contains_edges(result)
     assert (enum["id"], nodes[".Standard"]["id"]) in contains
     assert (enum["id"], nodes[".Premium"]["id"]) in contains
@@ -81,13 +81,13 @@ def test_existing_object_and_procedure_nodes_unaffected(tmp_path):
     nodes = _by_label(result)
 
     # Object nodes still present.
-    for obj in ('"Widget"', '"Widget Type"', '"Widget Mgt"'):
+    for obj in ('Table 50100 "Widget"', 'Enum 50101 "Widget Type"', 'Codeunit 50102 "Widget Mgt"'):
         assert obj in nodes
 
     # File still `contains` each object (object containment edges intact).
     file_node = next(n for n in result["nodes"] if n["label"].endswith(".al"))
     contains = _contains_edges(result)
-    for obj in ('"Widget"', '"Widget Type"', '"Widget Mgt"'):
+    for obj in ('Table 50100 "Widget"', 'Enum 50101 "Widget Type"', 'Codeunit 50102 "Widget Mgt"'):
         assert (file_node["id"], nodes[obj]["id"]) in contains
 
     # Procedure node still modelled via the `method` edge, not `contains`.
@@ -97,6 +97,6 @@ def test_existing_object_and_procedure_nodes_unaffected(tmp_path):
         for e in result["edges"]
         if e.get("relation") == "method"
     }
-    assert (nodes['"Widget Mgt"']["id"], proc["id"]) in method_edges
+    assert (nodes['Codeunit 50102 "Widget Mgt"']["id"], proc["id"]) in method_edges
     # The procedure is not turned into a `contains` member.
-    assert (nodes['"Widget Mgt"']["id"], proc["id"]) not in contains
+    assert (nodes['Codeunit 50102 "Widget Mgt"']["id"], proc["id"]) not in contains

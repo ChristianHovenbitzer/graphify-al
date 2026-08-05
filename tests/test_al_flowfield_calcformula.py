@@ -78,7 +78,7 @@ def test_flowfield_calcformula_edge_to_source_table(tmp_path: Path):
     targets = _computes_targets(result)
     # In-corpus source table resolves to its real object node (quoted-object labels
     # keep their quotes, per graphify's AL node-label convention).
-    assert '"Sample Ledger Entry"' in targets
+    assert 'Table 50101 "Sample Ledger Entry"' in targets
     # Source table outside the analyzed corpus becomes an external stub, not dropped.
     assert "Not In Corpus Entry" in targets
 
@@ -91,7 +91,7 @@ def test_flowfield_calcformula_records_source_field(tmp_path: Path):
         e.get("member")
         for e in result["edges"]
         if e.get("relation") == "computes_from"
-        and _label(result, e["target"]) == '"Sample Ledger Entry"'
+        and _label(result, e["target"]) == 'Table 50101 "Sample Ledger Entry"'
     }
     # The `sum(...Amount...)` source field is captured on the edge.
     assert "Amount" in members

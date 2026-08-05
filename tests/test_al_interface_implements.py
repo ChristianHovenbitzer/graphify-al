@@ -51,20 +51,20 @@ def test_al_implements_and_enum_bound_implementation_edges(tmp_path: Path):
     result = extract(files, cache_root=tmp_path / "cache")
 
     # The interface object is a node in its own right.
-    assert "IPay" in {n.get("label") for n in result["nodes"]}
+    assert 'Interface "IPay"' in {n.get("label") for n in result["nodes"]}
 
     impl_edges = _edge_labels(result, ("implements",))
     bind_edges = _edge_labels(result, ("enum_binds_implementation",))
 
     # 1. codeunit ... implements IFoo
-    assert ("PayCard", "implements", "IPay") in impl_edges
+    assert ('Codeunit 50100 "PayCard"', "implements", 'Interface "IPay"') in impl_edges
     # 2a. enum binds the concrete impl codeunit — anchored on the enum VALUE node
     # (".PayPal"), not the enum object.
-    assert (".PayPal", "enum_binds_implementation", "PayPalImpl") in bind_edges
+    assert (".PayPal", "enum_binds_implementation", 'Codeunit 50102 "PayPalImpl"') in bind_edges
     # 2b. the enum-bound impl implements the interface
-    assert ("PayPalImpl", "implements", "IPay") in impl_edges
+    assert ('Codeunit 50102 "PayPalImpl"', "implements", 'Interface "IPay"') in impl_edges
     # 2c. the enum's own implements clause
-    assert ("PayMethod", "implements", "IPay") in impl_edges
+    assert ('Enum 50101 "PayMethod"', "implements", 'Interface "IPay"') in impl_edges
 
 
 def test_al_implements_edges_are_extracted_confidence(tmp_path: Path):

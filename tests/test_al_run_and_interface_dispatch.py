@@ -51,7 +51,7 @@ def test_al_codeunit_run_dispatch_resolves(tmp_path: Path):
     ))
     result = extract([impl, caller], cache_root=tmp_path / "cache")
 
-    assert (".Go()", '"My Impl"') in _calls_edges(result)
+    assert (".Go()", 'Codeunit 50101 "My Impl"') in _calls_edges(result)
 
 
 def test_al_interface_variable_dispatch_fans_out(tmp_path: Path):
@@ -103,4 +103,4 @@ def test_al_interface_variable_dispatch_lands_on_object_when_no_proc(tmp_path: P
     ))
     result = extract([iface, card, caller], cache_root=tmp_path / "cache")
 
-    assert (".Pay()", "PayCard") in _calls_edges(result)
+    assert (".Pay()", 'Codeunit 50100 "PayCard"') in _calls_edges(result)

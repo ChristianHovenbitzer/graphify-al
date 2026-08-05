@@ -53,7 +53,7 @@ def test_keys_are_nodes_parented_to_table(tmp_path):
     result = _extract(tmp_path)
     nodes = _by_label(result)
 
-    table = nodes['"Widget"']
+    table = nodes['Table 50100 "Widget"']
     pk = nodes[".key(PK)"]
     sec = nodes[".key(Name)"]
 
@@ -102,7 +102,7 @@ def test_tableextension_keys_are_extracted(tmp_path):
     result = _extract(tmp_path)
     nodes = _by_label(result)
 
-    ext = nodes['"Widget Ext"']
+    ext = nodes['TableExtension 50101 "Widget Ext"']
     rk = nodes[".key(RegionKey)"]
     assert rk["al_member_kind"] == "key"
     assert rk["key_fields"] == ['"Region Code"']

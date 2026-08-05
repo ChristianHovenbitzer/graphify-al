@@ -83,6 +83,6 @@ def test_subscribes_edge_resolves_to_publisher_procedure(tmp_path: Path):
     # ... and targets the publisher PROCEDURE node, not the publisher OBJECT.
     assert _label(result, edge["target"]) == ".OnBeforeDoThing()"
 
-    pub_obj = _node_by_label(result, "EventPub")
+    pub_obj = _node_by_label(result, 'Codeunit 50000 "EventPub"')
     assert pub_obj is not None
     assert edge["target"] != pub_obj["id"]

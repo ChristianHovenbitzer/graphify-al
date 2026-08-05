@@ -31,8 +31,11 @@ def _obj_nodes(result: dict) -> list[dict]:
 
 
 def _by_name(result: dict, name: str) -> dict:
+    # Real object nodes carry the bare name separately in `al_object_name`
+    # (`label` is now the full type+ID+name canonical reference, spec
+    # 004-al-object-labels).
     for n in _obj_nodes(result):
-        if str(n.get("label", "")).strip('"').lower() == name.lower():
+        if str(n.get("al_object_name", "")).lower() == name.lower():
             return n
     raise AssertionError(f"object {name!r} not found")
 

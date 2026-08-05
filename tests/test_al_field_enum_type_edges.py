@@ -61,7 +61,7 @@ def test_typed_as_edge_resolves_from_field_to_enum_node(tmp_path):
 
     result = extract([order, ctype], cache_root=tmp_path)
 
-    enum_obj = next(n["id"] for n in result["nodes"] if n["label"] == '"Contact Type"')
+    enum_obj = next(n["id"] for n in result["nodes"] if n["label"] == 'Enum 50101 "Contact Type"')
     field_node = next(n["id"] for n in result["nodes"] if n["label"] == '."Contact Type"')
 
     typed = _typed_edges(result)

@@ -48,7 +48,10 @@ def test_al_node_text_attributes(tmp_path: Path):
 
     # Object node (table declaration on line 2).
     obj = by_line[2]
-    assert obj["label"] == "SampleThing"          # existing display name is untouched
+    # Canonical type+ID+name reference (spec 004-al-object-labels), not just
+    # the bare name -- the caption/tooltip attachment below is unaffected by
+    # that change, only the label's own content is.
+    assert obj["label"] == 'Table 50100 "SampleThing"'
     assert obj["doc"] == "The sample record table."
     assert obj["al_label"] == "A reusable message."
     # #36: a member's Caption/ToolTip attaches to the MEMBER's own node, never to
