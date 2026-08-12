@@ -710,6 +710,29 @@ def _build_server(graph_path: str, *, instructions: str | None = None):
                 },
             ),
             types.Tool(
+                name="resolve_node",
+                description=(
+                    "Deterministically resolve an AL symbol to its canonical node ID."
+                    " Pass the object type (table, page, codeunit, report, enum,"
+                    " tableextension, ...), the object name, and optionally a member"
+                    " (field, procedure or trigger name). Returns the matching node"
+                    " IDs with source anchors -- feed an ID into get_neighbors to"
+                    " traverse. PREFER this over get_node whenever you know what kind"
+                    " of thing you are looking for (get_node is fuzzy and may return"
+                    " a similarly named page control instead of the table)."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "object_type": {"type": "string", "description": "AL object type, e.g. 'table', 'page', 'codeunit'"},
+                        "object_name": {"type": "string", "description": "Object name, e.g. 'VAT Posting Setup'"},
+                        "member": {"type": "string", "description": "Optional field/procedure/trigger name, e.g. 'VAT Calculation Type' or 'FailIfVATPostingSetupHasVATEntries'"},
+                        "limit": {"type": "integer", "default": 10, "description": "Max results"},
+                    },
+                    "required": ["object_type", "object_name"],
+                },
+            ),
+            types.Tool(
                 name="get_neighbors",
                 description="Get all direct neighbors of a node with edge details.",
                 inputSchema={
@@ -830,13 +853,7 @@ def _build_server(graph_path: str, *, instructions: str | None = None):
         )
         return result
 
-    def _tool_get_node(arguments: dict) -> str:
-        label = arguments["label"].lower()
-        matches = [(nid, d) for nid, d in G.nodes(data=True)
-                   if label in (d.get("label") or "").lower() or label == nid.lower()]
-        if not matches:
-            return f"No node matching '{label}' found."
-        nid, d = matches[0]
+    def _node_card(nid: str, d: dict) -> str:
         # Sanitise every LLM-derived field before concatenation (F-010).
         return "\n".join([
             f"Node: {sanitize_label(d.get('label', nid))}",
@@ -847,6 +864,94 @@ def _build_server(graph_path: str, *, instructions: str | None = None):
             f"  Degree: {G.degree(nid)}",
         ])
 
+    def _tool_get_node(arguments: dict) -> str:
+        label = arguments["label"]
+        matches = _find_node(G, label)
+        if not matches:
+            return f"No node matching '{label}' found."
+        # A fuzzy label like "VAT Posting Setup" legitimately matches a table
+        # AND page controls -- surface the ambiguity instead of silently
+        # returning an arbitrary first hit.
+        cards = [_node_card(nid, G.nodes[nid]) for nid in matches[:5]]
+        header = "" if len(matches) == 1 else (
+            f"{len(matches)} nodes match '{sanitize_label(label)}' -- top"
+            f" {len(cards)} below. If you know the object type, use"
+            " resolve_node for a deterministic match.\n\n"
+        )
+        return header + "\n\n".join(cards)
+
+    _ID_TOKEN = re.compile(r"[a-z0-9]+")
+
+    def _norm_id_segment(text: str) -> str:
+        return "_".join(_ID_TOKEN.findall(_strip_diacritics(str(text)).lower()))
+
+    def _tool_resolve_node(arguments: dict) -> str:
+        obj_type = _norm_id_segment(arguments["object_type"])
+        obj_name = _norm_id_segment(arguments["object_name"])
+        member = _norm_id_segment(arguments.get("member") or "")
+        limit = int(arguments.get("limit", 10))
+        obj_seg = f"_{obj_type}_{obj_name}"
+        exact: list[str] = []
+        related: list[str] = []
+        for nid in G.nodes:
+            pos = nid.find(obj_seg)
+            if pos < 0:
+                continue
+            rest = nid[pos + len(obj_seg):]
+            if member:
+                if rest == f"_{member}":
+                    exact.append(nid)
+                elif rest.startswith(f"_{member}_") or (rest.startswith("_") and member in rest):
+                    related.append(nid)
+            else:
+                if rest == "":
+                    exact.append(nid)
+                elif rest.startswith("_"):
+                    related.append(nid)
+        if not exact and not related:
+            return (
+                f"No node found for {arguments['object_type']}"
+                f" '{arguments['object_name']}'"
+                + (f" member '{arguments['member']}'" if arguments.get("member") else "")
+                + ". Check spelling; names are matched on their canonical ID"
+                " segments (case/punctuation-insensitive)."
+            )
+        ordered = exact + related
+        cards = [_node_card(nid, G.nodes[nid]) for nid in ordered[:limit]]
+        note = "" if member or not related else (
+            f"\n\n({len(related)} member nodes exist under this object --"
+            " pass member=... to resolve one, or get_neighbors on the object"
+            " ID to list contains-edges.)"
+        )
+        return "\n\n".join(cards) + note
+
+    def _qualified_label(nid: str) -> str:
+        """Member labels like '.OnValidate()' are ambiguous on their own --
+        qualify them with their owner chain (field/procedure and object) so a
+        traversal result reads 'OnValidate of "VAT Calculation Type" in table
+        "VAT Posting Setup"' instead of a bare trigger name."""
+        label = G.nodes[nid].get("label", nid)
+        if not str(label).startswith("."):
+            return sanitize_label(label)
+        owners = []
+        current = nid
+        for _ in range(3):
+            owner = next(
+                (p for p in G.predecessors(current)
+                 if edge_data(G, p, current).get("relation") in ("contains", "trigger", "method")),
+                None,
+            )
+            if owner is None:
+                break
+            owners.append(G.nodes[owner].get("label", owner))
+            current = owner
+            if not str(owners[-1]).startswith("."):
+                break
+        if not owners:
+            return sanitize_label(label)
+        chain = " of ".join(sanitize_label(o) for o in owners)
+        return f"{sanitize_label(label)} of {chain}"
+
     def _tool_get_neighbors(arguments: dict) -> str:
         label = arguments["label"].lower()
         rel_filter = arguments.get("relation_filter", "").lower()
@@ -854,15 +959,16 @@ def _build_server(graph_path: str, *, instructions: str | None = None):
         if not matches:
             return f"No node matching '{label}' found."
         nid = matches[0]
-        lines = [f"Neighbors of {sanitize_label(G.nodes[nid].get('label', nid))}:"]
+        lines = [f"Neighbors of {_qualified_label(nid)} [id: {sanitize_label(nid)}]:"]
         for nb in G.successors(nid):
             d = edge_data(G, nid, nb)
             rel = d.get("relation", "")
             if rel_filter and rel_filter not in rel.lower():
                 continue
             lines.append(
-                f"  --> {sanitize_label(G.nodes[nb].get('label', nb))} "
+                f"  --> {_qualified_label(nb)} "
                 f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]"
+                f" [id: {sanitize_label(nb)}]"
             )
         for nb in G.predecessors(nid):
             d = edge_data(G, nb, nid)
@@ -870,8 +976,9 @@ def _build_server(graph_path: str, *, instructions: str | None = None):
             if rel_filter and rel_filter not in rel.lower():
                 continue
             lines.append(
-                f"  <-- {sanitize_label(G.nodes[nb].get('label', nb))} "
+                f"  <-- {_qualified_label(nb)} "
                 f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]"
+                f" [id: {sanitize_label(nb)}]"
             )
         return "\n".join(lines)
 
@@ -1052,6 +1159,7 @@ def _build_server(graph_path: str, *, instructions: str | None = None):
     _handlers = {
         "query_graph": _tool_query_graph,
         "get_node": _tool_get_node,
+        "resolve_node": _tool_resolve_node,
         "get_neighbors": _tool_get_neighbors,
         "get_community": _tool_get_community,
         "god_nodes": _tool_god_nodes,
