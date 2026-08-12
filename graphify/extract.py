@@ -6279,20 +6279,25 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
     objnode_by_id: dict[str, dict] = {n["id"]: n for n in objnodes}
 
     new_nodes: list[dict] = []
-    ext_cache: dict[str, str] = {}
+    ext_cache: dict[tuple, str] = {}
     existing_ids: set = {n["id"] for n in all_nodes}
 
     def ensure_external(label: str, qualifier: str = "", obj_type: str = "") -> str:
-        # Existing dedup is by name (BC object names are globally unique), so the
-        # same external object referenced via different facts collapses to one
-        # stub. #27: stamp a `global_id` on the stub keyed the same way a real
-        # node keys itself, so a federation resolver can join the two graphs.
-        # The first reference to name it wins the (type, qualifier) — later refs
-        # reuse the cached stub unchanged.
-        key = label.lower()
+        # Dedup is by (type, name), not name alone (#31): BC allows a table and a
+        # codeunit (or other object-type pairs) to share a bare name (e.g. Table
+        # "No. Series" / Codeunit "No. Series"), so two references that disagree
+        # on type must land on distinct stubs rather than merging into whichever
+        # one was created first. A reference with no type info (obj_type == "")
+        # gets its own bucket too — it can't be known here whether it's the same
+        # real object as an already-typed stub for this name. #27: stamp a
+        # `global_id` on the stub keyed the same way a real node keys itself, so
+        # a federation resolver can join the two graphs. The first reference to
+        # (type, name) wins the qualifier — later refs reuse the cached stub
+        # unchanged.
+        key = (obj_type.strip().lower(), label.lower())
         if key in ext_cache:
             return ext_cache[key]
-        nid = "al_ext_" + _make_id(label)
+        nid = "al_ext_" + _make_id(obj_type, label)
         stub = {"label": label, "file_type": "external",
                 "source_file": "", "source_location": "L1",
                 "_origin": "al_external", "id": nid,
@@ -6585,20 +6590,44 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
                 if f.get("target_kind"):
                     # navigates_to RunObject keyword (page/report/...) types the stub (#28).
                     stub_type = f.get("target_kind")
-                tgt = obj_by_name.get(key) or ensure_external(
-                    tname, src_qualifier, stub_type)
+                obj_id = obj_by_name.get(key)
                 if f["kind"] == "calls":
-                    tgt = proc_by_objmeth.get((tgt, str(f.get("method", "")).lower()), tgt)
+                    meth_raw = str(f.get("method", "")).strip()
+                    meth = meth_raw.lower()
+                    if obj_id:
+                        tgt = proc_by_objmeth.get((obj_id, meth), obj_id)
+                    elif meth_raw:
+                        # #31: the target object isn't in this corpus, but the
+                        # specific procedure called is known — mint a per-member
+                        # stub (Object.Method), mirroring resolve_field's per-
+                        # field stubs, so a call across an app boundary keeps the
+                        # exact member referenced instead of collapsing to the
+                        # object-level stub (which loses it — recoverable only by
+                        # re-reading the caller's source text by hand).
+                        tgt = ensure_external(
+                            f"{_al_strip_quotes(tname)}.{meth_raw}", src_qualifier)
+                    else:
+                        tgt = ensure_external(tname, src_qualifier, stub_type)
                 elif f["kind"] == "subscribes":
-                    evname = str(f.get("event", "")).lower()
+                    ev_raw = str(f.get("event", "")).strip()
+                    evname = ev_raw.lower()
                     fldname = str(f.get("field", "")).strip()
                     if fldname and "validate" in evname:
                         # OnBefore/OnAfterValidateEvent's 4th arg names the field;
                         # resolve to that field's node so the subscription attaches
                         # to the field, not the whole table.
                         tgt = resolve_field(tname, fldname)
-                    elif evname:
-                        tgt = proc_by_objmeth.get((tgt, evname), tgt)
+                    elif obj_id:
+                        tgt = proc_by_objmeth.get((obj_id, evname), obj_id) if evname else obj_id
+                    elif ev_raw:
+                        # #31: same per-member stub treatment as `calls` above,
+                        # for a subscription onto an out-of-corpus publisher.
+                        tgt = ensure_external(
+                            f"{_al_strip_quotes(tname)}.{ev_raw}", src_qualifier)
+                    else:
+                        tgt = ensure_external(tname, src_qualifier, stub_type)
+                else:
+                    tgt = obj_id or ensure_external(tname, src_qualifier, stub_type)
             if src == tgt:
                 continue
             rel = _REL[f["kind"]]

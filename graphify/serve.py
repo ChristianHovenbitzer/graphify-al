@@ -837,20 +837,46 @@ def _find_node(G: nx.Graph, label: str) -> _NodeMatches:
     return result
 
 
+_GLOBAL_ID_RE = re.compile(r"^al://(?P<q>[^/]*)/(?P<t>[^/]*)/(?P<n>.*)$")
+
+
+def _al_global_id_type_name(global_id: str) -> tuple[str, str] | None:
+    """(type, name) parsed out of a `global_id`, ignoring its qualifier."""
+    m = _GLOBAL_ID_RE.match(global_id or "")
+    return (m.group("t"), m.group("n")) if m else None
+
+
 def _find_node_by_global_id(G: nx.Graph, global_id: str) -> list[str]:
-    """Node IDs whose `global_id` exactly matches (bc-code-atlas #26).
+    """Node IDs matching `global_id` (bc-code-atlas #26).
 
     `global_id` (`al://<qualifier>/<type>/<name>`) is a deterministic join key
     computed so a stub in one corpus and the real object in another carry the
     same value -- this is the resolver half of that: given a `global_id`
     copied from one graph, find the matching node(s) on this one, for
-    cross-graph federation at query time. Exact match only, case-sensitive
-    like the value itself (already lowercased at extraction).
+    cross-graph federation at query time.
+
+    Tries an exact match first. #31: two independently-built graphs can still
+    disagree on the qualifier for the same real object -- the referencing app
+    never imported the target's own `namespace` declaration, so its external
+    stub's `global_id` carries an empty qualifier while the object's own
+    corpus resolves a real one. When no exact match is found, fall back to
+    matching on type+name alone (safe in practice -- BC enforces object-name
+    uniqueness per type), so a caller handing over an unqualified/mismatched
+    `global_id` still gets a candidate instead of a hard miss.
     """
     term = (global_id or "").strip()
     if not term:
         return []
-    return [nid for nid, d in G.nodes(data=True) if d.get("global_id") == term]
+    exact = [nid for nid, d in G.nodes(data=True) if d.get("global_id") == term]
+    if exact:
+        return exact
+    parsed = _al_global_id_type_name(term)
+    if not parsed:
+        return []
+    return [
+        nid for nid, d in G.nodes(data=True)
+        if _al_global_id_type_name(str(d.get("global_id", ""))) == parsed
+    ]
 
 
 def _filter_blank_stdin() -> None:
@@ -1048,7 +1074,11 @@ def _build_server(
                     " objects and external stubs alike), so a stub for object"
                     " X in one corpus and the real X node in its own corpus"
                     " share the same value -- use this to bridge two"
-                    " independently-hosted graphs at query time."
+                    " independently-hosted graphs at query time. Falls back to"
+                    " a type+name match when no exact match is found (the"
+                    " qualifier can legitimately differ between graphs), so"
+                    " an unqualified or mismatched `global_id` still returns"
+                    " candidates instead of a hard miss."
                 ),
                 inputSchema={
                     "type": "object",
@@ -1304,7 +1334,19 @@ def _build_server(
         node_ids = _find_node_by_global_id(ctx.G, global_id)
         if not node_ids:
             return f"No node with global_id '{sanitize_label(global_id)}' found on this graph."
-        lines = [f"{len(node_ids)} node(s) matching global_id '{sanitize_label(global_id)}':"]
+        # #31: an empty result would have gone through the type+name fallback
+        # too, so any non-empty result here is exact only when its own
+        # global_id equals the query verbatim -- otherwise every node in it
+        # matched by type+name alone (qualifier differed), and the caller
+        # should know that's a lower-confidence resolution.
+        exact = ctx.G.nodes[node_ids[0]].get("global_id") == global_id
+        if exact:
+            lines = [f"{len(node_ids)} node(s) matching global_id '{sanitize_label(global_id)}':"]
+        else:
+            lines = [
+                f"global_id '{sanitize_label(global_id)}' not found exactly.",
+                f"{len(node_ids)} candidate(s) by type+name:",
+            ]
         for nid in node_ids:
             d = ctx.G.nodes[nid]
             lines.append(
