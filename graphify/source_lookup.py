@@ -38,9 +38,19 @@ def _collect_spans(node, target_line: int, ctx: dict) -> None:
     end = node.end_point[0] + 1
     if not (start <= target_line <= end):
         return
-    if node.type in _AL_CONFIG.class_types:
+    # First match wins (outermost, since this walk is top-down), not last.
+    # Some tree-sitter grammars -- confirmed for tree-sitter-al's compound
+    # "procedure" rule -- give a declaration node the same `type` string as
+    # one of its own descendant keyword tokens (e.g. the anonymous leaf for
+    # the literal "procedure" keyword is itself typed "procedure"). An
+    # unconditional overwrite here lets that inner leaf clobber the real
+    # declaration node once recursion reaches it, so get_signature/
+    # get_procedure_body ends up extracting from that leaf's tiny span
+    # instead of the actual declaration -- reproduced live as both
+    # returning the bare string "procedure" for every AL procedure.
+    if node.type in _AL_CONFIG.class_types and ctx.get("object") is None:
         ctx["object"] = node
-    if node.type in _AL_CONFIG.function_types:
+    if node.type in _AL_CONFIG.function_types and ctx.get("function") is None:
         ctx["function"] = node
     for child in node.children:
         _collect_spans(child, target_line, ctx)
