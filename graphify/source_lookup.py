@@ -59,6 +59,17 @@ def _collect_spans(node, target_line: int, ctx: dict) -> None:
 def _header_text(node, source: bytes) -> str:
     body = node.child_by_field_name(_AL_CONFIG.body_field)
     end = body.start_byte if body is not None else node.end_byte
+    # `body` only anchors the begin/end block itself -- a var section
+    # (local variable declarations) sits between the signature and the
+    # body but has no field name of its own (confirmed via tree-sitter-al's
+    # own field mapping: "var_section" is an unnamed/positional child), so
+    # without this it's silently included as part of "the header" too --
+    # reproduced live: get_signature returning the full var section
+    # trailing after the real signature line. Var declarations aren't part
+    # of the signature; cut there instead when a var section precedes body.
+    var_section = next((c for c in node.children if c.type == "var_section"), None)
+    if var_section is not None and var_section.start_byte < end:
+        end = var_section.start_byte
     return source[node.start_byte:end].decode("utf-8", errors="replace").rstrip()
 
 
