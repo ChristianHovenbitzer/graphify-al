@@ -499,19 +499,44 @@ def _resolve_context_filters(question: str, explicit_filters: list[str] | None =
     return [], None
 
 
+def _crosses_app_boundary(G: nx.Graph, u: str, v: str) -> bool:
+    """True if `u` and `v` have different, both-known `al_owning_app` tags
+    (bc-code-atlas #27). Neither missing-tag node (non-AL corpus, or a file
+    with no discoverable app.json) counts as crossing anything -- an unknown
+    boundary is not a confirmed one."""
+    au = G.nodes[u].get("al_owning_app")
+    av = G.nodes[v].get("al_owning_app")
+    return bool(au) and bool(av) and au != av
+
+
 def _filter_graph_by_context(G: nx.Graph, context_filters: list[str] | None) -> nx.Graph:
     filters = set(_normalize_context_filters(context_filters))
     if not filters:
         return G
+    # "cross_app" is a structural predicate (owning-app mismatch across the
+    # edge's two endpoints), not an edge `context`/relation-kind value like
+    # the rest of `filters` -- so it's split out and ANDed against whatever
+    # relation-kind filters remain, rather than joining the context
+    # whitelist it can never literally match (bc-code-atlas #27).
+    cross_app_only = "cross_app" in filters
+    relation_filters = filters - {"cross_app"}
     H = G.__class__()
     H.add_nodes_from(G.nodes(data=True))
+
+    def _keep(u: str, v: str, data: dict) -> bool:
+        if relation_filters and data.get("context") not in relation_filters:
+            return False
+        if cross_app_only and not _crosses_app_boundary(G, u, v):
+            return False
+        return True
+
     if isinstance(G, (nx.MultiGraph, nx.MultiDiGraph)):
         for u, v, key, data in G.edges(keys=True, data=True):
-            if data.get("context") in filters:
+            if _keep(u, v, data):
                 H.add_edge(u, v, key=key, **data)
     else:
         for u, v, data in G.edges(data=True):
-            if data.get("context") in filters:
+            if _keep(u, v, data):
                 H.add_edge(u, v, **data)
     return H
 
@@ -812,6 +837,22 @@ def _find_node(G: nx.Graph, label: str) -> _NodeMatches:
     return result
 
 
+def _find_node_by_global_id(G: nx.Graph, global_id: str) -> list[str]:
+    """Node IDs whose `global_id` exactly matches (bc-code-atlas #26).
+
+    `global_id` (`al://<qualifier>/<type>/<name>`) is a deterministic join key
+    computed so a stub in one corpus and the real object in another carry the
+    same value -- this is the resolver half of that: given a `global_id`
+    copied from one graph, find the matching node(s) on this one, for
+    cross-graph federation at query time. Exact match only, case-sensitive
+    like the value itself (already lowercased at extraction).
+    """
+    term = (global_id or "").strip()
+    if not term:
+        return []
+    return [nid for nid, d in G.nodes(data=True) if d.get("global_id") == term]
+
+
 def _filter_blank_stdin() -> None:
     """Filter blank lines from stdin before MCP reads it.
 
@@ -969,7 +1010,16 @@ def _build_server(
                         "context_filter": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Optional explicit edge-context filter, e.g. ['call', 'field']",
+                            "description": (
+                                "Optional explicit edge-context filter, e.g."
+                                " ['call', 'field']. Also accepts 'cross_app',"
+                                " a structural filter (not a relation kind) that"
+                                " keeps only edges whose two endpoints belong to"
+                                " different apps (AL corpora only) -- combine it"
+                                " with a relation kind (e.g. ['cross_app', 'call'])"
+                                " to see only cross-app calls, or use it alone"
+                                " for every cross-app edge regardless of kind."
+                            ),
                         },
                         **_ROUTING_SCHEMA_PROPERTIES,
                     },
@@ -986,6 +1036,27 @@ def _build_server(
                         **_ROUTING_SCHEMA_PROPERTIES,
                     },
                     "required": ["label"],
+                },
+            ),
+            types.Tool(
+                name="bcatlas_find_by_global_id",
+                description=(
+                    "Cross-graph federation lookup: find the node(s) on THIS"
+                    " graph matching a `global_id` value copied from another"
+                    " graph's bcatlas_get_node output. `global_id` is a"
+                    " deterministic join key stamped on every AL node (real"
+                    " objects and external stubs alike), so a stub for object"
+                    " X in one corpus and the real X node in its own corpus"
+                    " share the same value -- use this to bridge two"
+                    " independently-hosted graphs at query time."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "global_id": {"type": "string", "description": "global_id value to look up, e.g. from another graph's bcatlas_get_node output"},
+                        **_ROUTING_SCHEMA_PROPERTIES,
+                    },
+                    "required": ["global_id"],
                 },
             ),
             types.Tool(
@@ -1206,14 +1277,43 @@ def _build_server(
         nid = matches[0]
         d = ctx.G.nodes[nid]
         # Sanitise every LLM-derived field before concatenation (F-010).
-        return "\n".join([
+        lines = [
             f"Node: {sanitize_label(d.get('label', nid))}",
             f"  ID: {sanitize_label(nid)}",
             f"  Source: {sanitize_label(str(d.get('source_file', '')))} {sanitize_label(str(d.get('source_location', '')))}",
             f"  Type: {sanitize_label(str(d.get('file_type', '')))}",
             f"  Community: {sanitize_label(str(d.get('community_name') or d.get('community', '')))}",
             f"  Degree: {ctx.G.degree(nid)}",
-        ])
+        ]
+        # global_id/al_owning_app only exist on AL nodes (bc-code-atlas #26/#27)
+        # -- omitted rather than printed blank for every non-AL node/corpus.
+        global_id = d.get("global_id")
+        if global_id:
+            lines.append(f"  GlobalID: {sanitize_label(str(global_id))}")
+        owning_app = d.get("al_owning_app")
+        if owning_app:
+            lines.append(f"  OwningApp: {sanitize_label(str(owning_app))}")
+        return "\n".join(lines)
+
+    def _tool_find_by_global_id(arguments: dict) -> str:
+        try:
+            ctx = _resolve_ctx(arguments)
+        except _RoutingError as exc:
+            return str(exc)
+        global_id = arguments["global_id"]
+        node_ids = _find_node_by_global_id(ctx.G, global_id)
+        if not node_ids:
+            return f"No node with global_id '{sanitize_label(global_id)}' found on this graph."
+        lines = [f"{len(node_ids)} node(s) matching global_id '{sanitize_label(global_id)}':"]
+        for nid in node_ids:
+            d = ctx.G.nodes[nid]
+            lines.append(
+                f"  {sanitize_label(d.get('label', nid))}"
+                f" (ID: {sanitize_label(nid)},"
+                f" Source: {sanitize_label(str(d.get('source_file', '')))}"
+                f" {sanitize_label(str(d.get('source_location', '')))})"
+            )
+        return "\n".join(lines)
 
     def _tool_get_neighbors(arguments: dict) -> str:
         try:
@@ -1488,6 +1588,7 @@ def _build_server(
     _handlers = {
         "bcatlas_query_graph": _tool_query_graph,
         "bcatlas_get_node": _tool_get_node,
+        "bcatlas_find_by_global_id": _tool_find_by_global_id,
         "bcatlas_get_neighbors": _tool_get_neighbors,
         "bcatlas_get_signature": _tool_get_signature,
         "bcatlas_get_procedure_body": _tool_get_procedure_body,

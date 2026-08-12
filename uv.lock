@@ -846,7 +846,7 @@ wheels = [
 
 [[package]]
 name = "graphifyy"
-version = "0.8.45"
+version = "0.8.45.post2"
 source = { editable = "." }
 dependencies = [
     { name = "networkx" },

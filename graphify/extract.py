@@ -5075,17 +5075,14 @@ def _al_make_global_id(obj_type: str, name: str, qualifier: str) -> str:
 _AL_APP_QUALIFIER_CACHE: dict[str, str] = {}
 
 
-def _al_qualifier(path: Path, namespace: str) -> str:
-    """Best-available federation qualifier for an object declared in `path`.
+def _al_app_manifest_qualifier(path: Path) -> str:
+    """`app:<publisher>::<name>` from the nearest `app.json` above `path`, or ""
+    if none is found within 8 parent levels.
 
-    Prefers the AL `namespace` (namespaces are app-independent, so a base object
-    and a reference to it from another app share it — the property that makes the
-    federation join deterministic). Falls back to `app:<publisher>::<name>` from
-    the nearest `app.json` when there is no namespace, else "".
+    Cached per resolved parent directory (`_AL_APP_QUALIFIER_CACHE`) since this
+    walks the filesystem and every object declared in the same app would
+    otherwise re-trigger the same walk.
     """
-    ns = (namespace or "").strip()
-    if ns:
-        return ns
     try:
         start = str(Path(path).resolve().parent)
     except Exception:
@@ -5118,6 +5115,34 @@ def _al_qualifier(path: Path, namespace: str) -> str:
         qual = ""
     _AL_APP_QUALIFIER_CACHE[start] = qual
     return qual
+
+
+def _al_qualifier(path: Path, namespace: str) -> str:
+    """Best-available federation qualifier for an object declared in `path`.
+
+    Prefers the AL `namespace` (namespaces are app-independent, so a base object
+    and a reference to it from another app share it — the property that makes the
+    federation join deterministic). Falls back to `app:<publisher>::<name>` from
+    the nearest `app.json` when there is no namespace, else "".
+    """
+    ns = (namespace or "").strip()
+    if ns:
+        return ns
+    return _al_app_manifest_qualifier(path)
+
+
+def _al_owning_app(path: Path) -> str:
+    """Which app.json-declared app owns the file at `path` (bc-code-atlas #27:
+    cross-app boundary detection).
+
+    Deliberately independent of `_al_qualifier`'s namespace-first logic: two
+    distinct apps can legitimately share an AL namespace convention (e.g. a
+    publisher's own suite of interdependent apps), and namespace sharing is
+    exactly the thing `_al_qualifier` treats as "same federation identity" --
+    the opposite of what "which app owns this file" needs here. Always the
+    app.json identity, same value `_al_qualifier` only reaches as a fallback.
+    """
+    return _al_app_manifest_qualifier(path)
 
 
 def _al_type_object(type_text: str):
@@ -6624,6 +6649,18 @@ def extract_al(path: Path) -> dict:
         qualifier = _al_qualifier(path, namespace)
         result["al_namespace"] = namespace
         result["al_qualifier"] = qualifier
+        # bc-code-atlas #27: stamp which app owns this file onto every node it
+        # produced -- object nodes AND procedure/member/file nodes alike, since
+        # a cross-app boundary check needs to compare owning app on whichever
+        # node pair an edge actually connects (e.g. a `calls` edge between two
+        # procedures), not just on object nodes. One file always belongs to
+        # exactly one app, so this is safe to stamp unconditionally up front,
+        # before the object-only loop below narrows to real declarations.
+        owning_app = _al_owning_app(path)
+        result["al_owning_app"] = owning_app
+        if owning_app:
+            for n in result.get("nodes", []):
+                n.setdefault("al_owning_app", owning_app)
         for n in result.get("nodes", []):
             lbl = str(n.get("label", ""))
             if lbl.endswith(".al") or lbl.startswith("."):
