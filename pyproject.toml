@@ -118,6 +118,13 @@ graphify = ["skill.md", "skill-codex.md", "skill-opencode.md", "skill-kilo.md", 
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Red TDD specs (tests for not-yet-implemented extractor features) carry the
+# `red_spec` marker and are deselected by default so a plain `pytest` stays
+# green. Run them explicitly with: pytest -m red_spec
+addopts = '-m "not red_spec"'
+markers = [
+    "red_spec: red TDD specification for an unimplemented feature (deselected by default; run with -m red_spec)",
+]
 norecursedirs = [
     "graphify-benchmark", "graphify_eval", "graphify_test",
     "worked", "llm-stack-corpus", "llm-stack-demo", "product-site",
