@@ -215,3 +215,54 @@ def test_call_into_external_object_mints_per_member_stub(tmp_path: Path):
     obj_stubs = [n for n in _externals(result)
                  if str(n.get("label", "")).strip('"').lower() == "no. series"]
     assert all(n["id"] != member_id for n in obj_stubs)
+
+
+# (f) #33 follow-up to (e): the per-member stub minted for a call into an
+# out-of-corpus object must carry `al_object_type` (known from the call
+# site's own declared variable type) and a fully-typed `global_id`, not an
+# empty type segment -- else two differently-typed objects sharing a bare
+# name and a same-named method would collide on the same member stub.
+def test_call_into_external_object_member_stub_is_typed(tmp_path: Path):
+    result = _build(tmp_path, "app", {
+        "Test.Codeunit.al": (
+            'codeunit 50100 "Test"\n'
+            "{\n"
+            "    var\n"
+            '        NoSeriesMgt: Codeunit "No. Series";\n\n'
+            "    procedure GenerateDocumentNo()\n"
+            "    begin\n"
+            "        NoSeriesMgt.GetNextNo('X', WorkDate());\n"
+            "    end;\n"
+            "}\n"
+        ),
+    })
+    member_stub = next(
+        n for n in _externals(result)
+        if str(n.get("label", "")).lower() == "no. series.getnextno"
+    )
+    assert member_stub.get("al_object_type") == "codeunit"
+    assert member_stub.get("global_id") == "al:///codeunit/no. series.getnextno"
+
+
+# (g) #33: same typing fix for a subscribes edge onto an out-of-corpus
+# publisher -- the `[EventSubscriber(ObjectType::X, ...)]` attribute's own
+# publisher type carries onto the per-member stub, exactly mirroring (f).
+def test_subscribe_to_external_publisher_member_stub_is_typed(tmp_path: Path):
+    result = _build(tmp_path, "app", {
+        "Test.Codeunit.al": (
+            'codeunit 50100 "Test"\n'
+            "{\n"
+            '    [EventSubscriber(ObjectType::Codeunit, Codeunit::"Sales-Post",'
+            " 'OnAfterPostSalesDoc', '', false, false)]\n"
+            "    local procedure OnAfterPostSalesDoc()\n"
+            "    begin\n"
+            "    end;\n"
+            "}\n"
+        ),
+    })
+    member_stub = next(
+        n for n in _externals(result)
+        if str(n.get("label", "")).lower() == "sales-post.onafterpostsalesdoc"
+    )
+    assert member_stub.get("al_object_type") == "codeunit"
+    assert member_stub.get("global_id") == "al:///codeunit/sales-post.onafterpostsalesdoc"

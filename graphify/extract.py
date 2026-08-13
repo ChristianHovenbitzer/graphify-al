@@ -5202,7 +5202,8 @@ def _al_parse_event_subscriber(attr_text: str):
         target = f"{objtype} {num}"  # numeric base-object id, e.g. "Codeunit 80"
     else:
         return None
-    return {"target": target, "event": ev_q or ev_b or "", "field": fld or ""}
+    return {"target": target, "event": ev_q or ev_b or "", "field": fld or "",
+            "target_kind": objtype.lower()}
 
 
 def _al_parse_event_publisher(attr_text: str):
@@ -5285,7 +5286,8 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                         hit = varmap.get(text(ob).lower())
                         if hit and hit[0] in _AL_CODEUNIT_CLASSES:
                             facts.append({"kind": "calls", "src_line": proc_line,
-                                          "target": hit[1], "method": text(mem)})
+                                          "target": hit[1], "method": text(mem),
+                                          "target_kind": hit[0]})
                         elif hit and hit[0] == "interface":
                             # Interface dispatch: MyVar.Method() on an
                             # `Interface "IFoo"`-typed variable. The concrete target
@@ -5320,7 +5322,8 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                         tgt = run_dispatch_target(node, text(ob))
                         if tgt:
                             facts.append({"kind": "calls", "src_line": proc_line,
-                                          "target": tgt, "method": text(mem)})
+                                          "target": tgt, "method": text(mem),
+                                          "target_kind": text(ob).lower()})
         for c in node.children:
             walk_calls(c, proc_line, varmap, usercontrols)
 
@@ -6603,9 +6606,16 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
                         # field stubs, so a call across an app boundary keeps the
                         # exact member referenced instead of collapsing to the
                         # object-level stub (which loses it — recoverable only by
-                        # re-reading the caller's source text by hand).
+                        # re-reading the caller's source text by hand). #33: pass
+                        # along `stub_type` (known here from the call site's own
+                        # declared variable type) so the member stub carries
+                        # `al_object_type` and a fully-typed `global_id` just like
+                        # an object-level stub, instead of an untyped one that
+                        # could collide with a same-named member on a
+                        # differently-typed object.
                         tgt = ensure_external(
-                            f"{_al_strip_quotes(tname)}.{meth_raw}", src_qualifier)
+                            f"{_al_strip_quotes(tname)}.{meth_raw}", src_qualifier,
+                            stub_type)
                     else:
                         tgt = ensure_external(tname, src_qualifier, stub_type)
                 elif f["kind"] == "subscribes":
@@ -6620,10 +6630,14 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
                     elif obj_id:
                         tgt = proc_by_objmeth.get((obj_id, evname), obj_id) if evname else obj_id
                     elif ev_raw:
-                        # #31: same per-member stub treatment as `calls` above,
-                        # for a subscription onto an out-of-corpus publisher.
+                        # #31/#33: same per-member stub treatment as `calls`
+                        # above, for a subscription onto an out-of-corpus
+                        # publisher -- `stub_type` here comes from the
+                        # `[EventSubscriber(ObjectType::X, ...)]` attribute's
+                        # own publisher type, so the stub is typed too.
                         tgt = ensure_external(
-                            f"{_al_strip_quotes(tname)}.{ev_raw}", src_qualifier)
+                            f"{_al_strip_quotes(tname)}.{ev_raw}", src_qualifier,
+                            stub_type)
                     else:
                         tgt = ensure_external(tname, src_qualifier, stub_type)
                 else:
