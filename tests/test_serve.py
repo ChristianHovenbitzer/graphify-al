@@ -134,7 +134,8 @@ def test_find_node_matches_full_punctuated_unicode_label():
 
 
 def test_query_terms_strips_search_punctuation():
-    assert _query_terms("what calls extract?") == ["what", "calls", "extract"]
+    # "what" is a question stopword and gets filtered; punctuation is stripped.
+    assert _query_terms("what calls extract?") == ["calls", "extract"]
 
 
 def test_query_terms_filters_only_short_english_terms(monkeypatch):
