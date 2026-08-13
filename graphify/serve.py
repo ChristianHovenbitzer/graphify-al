@@ -249,6 +249,16 @@ def _search_tokens(text: str) -> list[str]:
     return re.findall(r"\w+", _strip_diacritics(str(text)).lower())
 
 
+_ID_TOKEN = re.compile(r"[a-z0-9]+")
+
+
+def _norm_id_segment(text: str) -> str:
+    """Normalize a name into the same underscore-token form `_make_id` uses
+    for node-ID segments, so resolve_node can match on the canonical ID
+    without recomputing the extractor's own ID scheme."""
+    return "_".join(_ID_TOKEN.findall(_strip_diacritics(str(text)).lower()))
+
+
 def _has_chinese(text: str) -> bool:
     return any("一" <= ch <= "鿿" for ch in text)
 
@@ -1065,6 +1075,31 @@ def _build_server(
                 },
             ),
             types.Tool(
+                name="bcatlas_resolve_node",
+                description=(
+                    "Deterministically resolve an AL symbol to its canonical node"
+                    " ID. Pass the object type (table, page, codeunit, report,"
+                    " enum, tableextension, ...), the object name, and optionally"
+                    " a member (field, procedure or trigger name). Returns the"
+                    " matching node IDs with source anchors -- feed an ID into"
+                    " bcatlas_get_neighbors to traverse. PREFER this over"
+                    " bcatlas_get_node whenever you know what kind of thing you"
+                    " are looking for (bcatlas_get_node is fuzzy and may return a"
+                    " similarly named page control instead of the table)."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "object_type": {"type": "string", "description": "AL object type, e.g. 'table', 'page', 'codeunit'"},
+                        "object_name": {"type": "string", "description": "Object name, e.g. 'VAT Posting Setup'"},
+                        "member": {"type": "string", "description": "Optional field/procedure/trigger name, e.g. 'VAT Calculation Type' or 'FailIfVATPostingSetupHasVATEntries'"},
+                        "limit": {"type": "integer", "default": 10, "description": "Max results"},
+                        **_ROUTING_SCHEMA_PROPERTIES,
+                    },
+                    "required": ["object_type", "object_name"],
+                },
+            ),
+            types.Tool(
                 name="bcatlas_find_by_global_id",
                 description=(
                     "Cross-graph federation lookup: find the node(s) on THIS"
@@ -1284,13 +1319,15 @@ def _build_server(
         # (now type+ID-qualified) label so the caller can retry
         # unambiguously, rather than silently taking matches[0].
         candidates = "\n".join(
-            f"  - {sanitize_label(G.nodes[nid].get('label', nid))}"
+            f"  - {sanitize_label(G.nodes[nid].get('label', nid))} [id: {sanitize_label(nid)}]"
             for nid in matches[: matches.top_tier_count]
         )
         return (
             f"Multiple objects match:\n{candidates}\n"
-            "Retry with the full object reference (e.g. the exact label "
-            "shown above) to disambiguate."
+            "Retry with one of the node IDs shown above (labels can collide,"
+            " e.g. a table field and a same-named page control), or use"
+            " bcatlas_resolve_node with the object_type/object_name (and"
+            " optional member) for a deterministic match."
         )
 
     def _tool_get_node(arguments: dict) -> str:
@@ -1325,6 +1362,61 @@ def _build_server(
             lines.append(f"  OwningApp: {sanitize_label(str(owning_app))}")
         return "\n".join(lines)
 
+    def _tool_resolve_node(arguments: dict) -> str:
+        try:
+            ctx = _resolve_ctx(arguments)
+        except _RoutingError as exc:
+            return str(exc)
+        G = ctx.G
+        obj_type = _norm_id_segment(arguments["object_type"])
+        obj_name = _norm_id_segment(arguments["object_name"])
+        member = _norm_id_segment(arguments.get("member") or "")
+        limit = int(arguments.get("limit", 10))
+        obj_seg = f"_{obj_type}_{obj_name}"
+        exact: list[str] = []
+        related: list[str] = []
+        for nid in G.nodes:
+            pos = nid.find(obj_seg)
+            if pos < 0:
+                continue
+            rest = nid[pos + len(obj_seg):]
+            if member:
+                if rest == f"_{member}":
+                    exact.append(nid)
+                elif rest.startswith(f"_{member}_") or (rest.startswith("_") and member in rest):
+                    related.append(nid)
+            else:
+                if rest == "":
+                    exact.append(nid)
+                elif rest.startswith("_"):
+                    related.append(nid)
+        if not exact and not related:
+            return (
+                f"No node found for {arguments['object_type']}"
+                f" '{arguments['object_name']}'"
+                + (f" member '{arguments['member']}'" if arguments.get("member") else "")
+                + ". Check spelling; names are matched on their canonical ID"
+                " segments (case/punctuation-insensitive)."
+            )
+        ordered = exact + related
+
+        def _card(nid: str) -> str:
+            d = G.nodes[nid]
+            return "\n".join([
+                f"Node: {sanitize_label(d.get('label', nid))}",
+                f"  ID: {sanitize_label(nid)}",
+                f"  Source: {sanitize_label(str(d.get('source_file', '')))} {sanitize_label(str(d.get('source_location', '')))}",
+                f"  Type: {sanitize_label(str(d.get('file_type', '')))}",
+            ])
+
+        cards = [_card(nid) for nid in ordered[:limit]]
+        note = "" if member or not related else (
+            f"\n\n({len(related)} member nodes exist under this object --"
+            " pass member=... to resolve one, or bcatlas_get_neighbors on the"
+            " object ID to list contains-edges.)"
+        )
+        return "\n\n".join(cards) + note
+
     def _tool_find_by_global_id(arguments: dict) -> str:
         try:
             ctx = _resolve_ctx(arguments)
@@ -1357,6 +1449,33 @@ def _build_server(
             )
         return "\n".join(lines)
 
+    def _qualified_label(G: nx.Graph, nid: str) -> str:
+        """Member labels like '.OnValidate()' are ambiguous on their own --
+        qualify them with their owner chain (field/procedure and object) so a
+        traversal result reads 'OnValidate of "VAT Calculation Type" in table
+        "VAT Posting Setup"' instead of a bare trigger name."""
+        label = G.nodes[nid].get("label", nid)
+        if not str(label).startswith("."):
+            return sanitize_label(label)
+        owners = []
+        current = nid
+        for _ in range(3):
+            owner = next(
+                (p for p in G.predecessors(current)
+                 if edge_data(G, p, current).get("relation") in ("contains", "trigger", "method")),
+                None,
+            )
+            if owner is None:
+                break
+            owners.append(G.nodes[owner].get("label", owner))
+            current = owner
+            if not str(owners[-1]).startswith("."):
+                break
+        if not owners:
+            return sanitize_label(label)
+        chain = " of ".join(sanitize_label(o) for o in owners)
+        return f"{sanitize_label(label)} of {chain}"
+
     def _tool_get_neighbors(arguments: dict) -> str:
         try:
             ctx = _resolve_ctx(arguments)
@@ -1371,15 +1490,16 @@ def _build_server(
         if matches.top_tier_count > 1:
             return _ambiguity_message(G, matches)
         nid = matches[0]
-        lines = [f"Neighbors of {sanitize_label(G.nodes[nid].get('label', nid))}:"]
+        lines = [f"Neighbors of {_qualified_label(G, nid)} [id: {sanitize_label(nid)}]:"]
         for nb in G.successors(nid):
             d = edge_data(G, nid, nb)
             rel = d.get("relation", "")
             if rel_filter and rel_filter not in rel.lower():
                 continue
             lines.append(
-                f"  --> {sanitize_label(G.nodes[nb].get('label', nb))} "
+                f"  --> {_qualified_label(G, nb)} "
                 f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]"
+                f" [id: {sanitize_label(nb)}]"
             )
         for nb in G.predecessors(nid):
             d = edge_data(G, nb, nid)
@@ -1387,8 +1507,9 @@ def _build_server(
             if rel_filter and rel_filter not in rel.lower():
                 continue
             lines.append(
-                f"  <-- {sanitize_label(G.nodes[nb].get('label', nb))} "
+                f"  <-- {_qualified_label(G, nb)} "
                 f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]"
+                f" [id: {sanitize_label(nb)}]"
             )
         return "\n".join(lines)
 
@@ -1630,6 +1751,7 @@ def _build_server(
     _handlers = {
         "bcatlas_query_graph": _tool_query_graph,
         "bcatlas_get_node": _tool_get_node,
+        "bcatlas_resolve_node": _tool_resolve_node,
         "bcatlas_find_by_global_id": _tool_find_by_global_id,
         "bcatlas_get_neighbors": _tool_get_neighbors,
         "bcatlas_get_signature": _tool_get_signature,
