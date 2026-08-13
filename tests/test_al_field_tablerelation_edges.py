@@ -61,7 +61,7 @@ def test_relates_to_edges_resolve_to_target_table_node(tmp_path):
 
     result = extract([order, terms], cache_root=tmp_path)
 
-    terms_obj = next(n["id"] for n in result["nodes"] if n["label"] == '"My Terms"')
+    terms_obj = next(n["id"] for n in result["nodes"] if n["label"] == 'Table 50101 "My Terms"')
 
     rel = _rel_edges(result)
     assert len(rel) == 1

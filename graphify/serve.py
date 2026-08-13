@@ -2,19 +2,203 @@
 from __future__ import annotations
 import json
 import math
+import os
 import re
 import sys
+from collections import OrderedDict
 from pathlib import Path
+from typing import NamedTuple
 import networkx as nx
 from networkx.readwrite import json_graph
-from graphify.security import sanitize_label, check_graph_file_size_cap
+from graphify.security import sanitize_label, check_graph_file_size_cap, validate_graph_path
 from graphify.build import edge_data
 from graphify.paths import default_graph_json as _default_graph_json
+from graphify import source_lookup
 
 try:
     import jieba as _jieba  # type: ignore[import-untyped]
 except ImportError:
     _jieba = None
+
+
+# --- multi-tenant routing (T029, specs/001-multi-version-serving in the
+# parent bc-code-atlas repo) -------------------------------------------
+#
+# graphify itself is a general-purpose, corpus-agnostic graph server (see
+# `_build_server`'s own docstring below) -- this fork
+# (tools/graphify-al, submodule branch `bc-code-atlas-fixes`) adds an
+# *opt-in* extra: every tool below accepts optional `country`/`version`
+# arguments that route the call to a different, already-built graph
+# instead of the one `graph_path` this server was started with. A caller
+# that never passes them gets byte-identical behavior to before this
+# change; only supplying both activates routing.
+
+
+# Shared JSON-schema fragment merged into every bcatlas_* tool's
+# inputSchema below -- one definition, ten call sites, so the wording
+# never drifts between tools.
+_ROUTING_SCHEMA_PROPERTIES: dict = {
+    "country": {
+        "type": "string",
+        "description": (
+            "Country code (e.g. 'w1', 'us') for a specific (country,"
+            " version) pair's graph instead of this server's default."
+            " Must be paired with `version` -- resolve both first (e.g."
+            " via the registry server's discovery/resolve tools). Omit"
+            " both to use the default graph."
+        ),
+    },
+    "version": {
+        "type": "string",
+        "description": (
+            "Exact resolved version string (e.g. 'w1-28.2.50931.52151')"
+            " for a specific (country, version) pair's graph, paired with"
+            " `country`. Omit both to use the default graph."
+        ),
+    },
+}
+
+
+class _RoutingError(Exception):
+    """A country/version routing request that must surface as a clean
+    tool-result error string to the caller, never a server crash or a
+    raw traceback.
+    """
+
+
+class _RoutedGraph(NamedTuple):
+    """Everything a tool handler needs for one specific graph -- either
+    this server's own default (bound at startup) or a routed
+    (country, version) pair loaded on demand.
+    """
+
+    G: nx.Graph
+    communities: dict[int, list[str]]
+    source_root: Path
+    graph_path: str
+
+
+# Bounded LRU cache of routed (country, version) graphs, on top of the one
+# always-resident default graph (G/communities/_source_root in
+# `_build_server`). 8 is a deliberately modest default: graph.json files
+# are already bounded by `check_graph_file_size_cap`, but a handful of
+# full networkx graphs held in memory simultaneously is still real
+# resident memory for a long-running shared serving process. 8 comfortably
+# covers "a few countries' current tips plus whatever a tester/agent is
+# actively poking at right now" at this PoC's scale without growing
+# unbounded -- tune via `_ROUTED_GRAPH_CACHE_SIZE` if that assumption
+# proves wrong once real multi-version traffic is measured.
+_ROUTED_GRAPH_CACHE_SIZE = 8
+_routed_graph_cache: "OrderedDict[tuple[str, str], _RoutedGraph]" = OrderedDict()
+
+
+def _bcatlas_data_root(explicit: str | None = None) -> Path:
+    """Root under which multi-tenant warm (country, version) data lives.
+
+    Mirrors `build/build/layout.py`'s `DEFAULT_DATA_DIR` convention
+    (`<repo_root>/data`) *without importing it*: this fork has no
+    dependency on the sibling `build/` project (which is being built in
+    parallel by another agent as of this change, in the parent
+    bc-code-atlas repo this submodule is vendored into), and the two
+    conventions must stay in sync regardless of which project changes
+    first. If a tiny shared "layout" package is ever extracted, this
+    should import that instead of hand-duplicating the convention --
+    tracked as a follow-up, not done here.
+
+    Overridable via the `data_root` argument threaded down from
+    `_main`'s `--data-root` flag / `GRAPHIFY_BCATLAS_DATA_ROOT` env var,
+    for deployments where this submodule doesn't sit at the expected
+    `tools/graphify-al` depth under the bc-code-atlas repo root.
+    """
+    if explicit:
+        return Path(explicit).resolve()
+    env = os.environ.get("GRAPHIFY_BCATLAS_DATA_ROOT")
+    if env:
+        return Path(env).resolve()
+    # tools/graphify-al/graphify/serve.py -> parents[3] is the repo root
+    # (serve.py's dir -> graphify-al -> tools -> repo root).
+    return Path(__file__).resolve().parents[3] / "data"
+
+
+def _warm_graph_json_path(country: str, version: str, data_root: Path) -> Path:
+    """Mirrors `build/build/layout.py`'s `warm_graph_dir(country, version)`
+    convention (`data/warm/<country>/<version>/graph`), plus the
+    `graph.json` filename this file always expects inside it.
+    """
+    return data_root / "warm" / country / version / "graph" / "graph.json"
+
+
+def _warm_source_root(country: str, version: str, data_root: Path) -> Path:
+    """Source root for a routed (country, version) pair's
+    get_signature/get_procedure_body/get_object_source lookups.
+
+    ASSUMPTION, documented rather than silently guessed: `layout.py` (as
+    of this change) only defines `warm_search_dir`/`warm_graph_dir`, no
+    dedicated "source" convention. cocoindex-code's "search" project
+    directory is itself the raw AL/docs source tree it indexes in place
+    -- this matches today's single-tenant deployment, where the search
+    project_root (`data/`) literally contains `w1-28-src/` -- so it
+    doubles as the routed graph's source_root here too. Reconcile with
+    `build/`'s actual on-disk layout once it lands, if it turns out to
+    define something more specific.
+    """
+    return data_root / "warm" / country / version / "search"
+
+
+def _load_routed_graph(
+    country: str, version: str, data_root_override: str | None
+) -> _RoutedGraph:
+    """Load (or return the cached) graph for one (country, version) pair.
+
+    Historical (country, version) builds are immutable once promoted
+    (constitution Principle III in the parent repo) -- unlike the
+    default graph's `_maybe_reload()` mtime-watch, a cached routed entry
+    is never invalidated by a background file change; the only way its
+    cache entry goes away is LRU eviction (cheap and correct to re-load
+    on the next request, since the source is immutable).
+    """
+    key = (country, version)
+    cached = _routed_graph_cache.get(key)
+    if cached is not None:
+        _routed_graph_cache.move_to_end(key)
+        return cached
+
+    data_root = _bcatlas_data_root(data_root_override)
+    graph_json_path = _warm_graph_json_path(country, version, data_root)
+    if not graph_json_path.exists():
+        raise _RoutingError(
+            f"No warm graph data found for country={country!r} version={version!r}"
+            f" -- expected a built graph at {graph_json_path}. This (country, version)"
+            " pair has not been built yet. Request it via the build server's"
+            " bcatlas_request_version tool (same country/version), then poll"
+            " bcatlas_version_status until it reports ready before retrying this call."
+        )
+    try:
+        # _load_graph calls sys.exit(1) on a missing/corrupted/oversized
+        # file -- correct for this file's own CLI/startup entry points
+        # (fail fast, don't serve a broken graph), but a single bad
+        # routed request must never take down a shared multi-tenant
+        # serving process for every other (country, version) pair. Same
+        # technique `_maybe_reload()` already uses below for the same
+        # reason.
+        loaded_g = _load_graph(str(graph_json_path))
+    except SystemExit:
+        raise _RoutingError(
+            f"Warm graph data for country={country!r} version={version!r} at"
+            f" {graph_json_path} is missing or corrupted -- a rebuild may be"
+            " required."
+        )
+    entry = _RoutedGraph(
+        G=loaded_g,
+        communities=_communities_from_graph(loaded_g),
+        source_root=_warm_source_root(country, version, data_root),
+        graph_path=str(graph_json_path),
+    )
+    _routed_graph_cache[key] = entry
+    _routed_graph_cache.move_to_end(key)
+    while len(_routed_graph_cache) > _ROUTED_GRAPH_CACHE_SIZE:
+        _routed_graph_cache.popitem(last=False)
+    return entry
 
 
 def _load_graph(graph_path: str) -> nx.Graph:
@@ -65,6 +249,16 @@ def _search_tokens(text: str) -> list[str]:
     return re.findall(r"\w+", _strip_diacritics(str(text)).lower())
 
 
+_ID_TOKEN = re.compile(r"[a-z0-9]+")
+
+
+def _norm_id_segment(text: str) -> str:
+    """Normalize a name into the same underscore-token form `_make_id` uses
+    for node-ID segments, so resolve_node can match on the canonical ID
+    without recomputing the extractor's own ID scheme."""
+    return "_".join(_ID_TOKEN.findall(_strip_diacritics(str(text)).lower()))
+
+
 def _has_chinese(text: str) -> bool:
     return any("一" <= ch <= "鿿" for ch in text)
 
@@ -80,10 +274,29 @@ def _segment_chinese(text: str) -> list[str]:
     return segments
 
 
+# English interrogative/functional words that legitimately appear in a
+# natural-language question but are noise (and occasionally dangerous) as
+# a symbol-search term. Concrete repro against the real w1-28-src graph:
+# "what subscribes to X" / "what calls X" tokenized "what" as a search
+# term, which hit the full-query exact-match tier in _score_nodes against
+# a real node literally labeled "What has been done" (a Translation
+# README heading), silently seeding the BFS on a bogus, unrelated root
+# with no error -- reproduced twice with different questions, same bogus
+# node both times. Bug found against real project data
+# (constitution Principle VI); fork branch bc-code-atlas-fixes.
+_QUESTION_STOPWORDS = frozenset({
+    "what", "which", "who", "whom", "whose", "when", "where", "why", "how",
+    "does", "do", "did", "is", "are", "was", "were", "be", "been", "being",
+    "the", "a", "an", "of", "to", "in", "on", "for", "with", "and", "or",
+    "this", "that", "these", "those", "can", "could", "would", "should",
+    "will", "shall", "please", "tell", "me", "show",
+})
+
+
 def _is_searchable(term: str) -> bool:
     """True if term is Chinese, non-English, or an English word longer than 2 chars."""
     if all("a" <= ch <= "z" for ch in term):
-        return len(term) > 2
+        return len(term) > 2 and term not in _QUESTION_STOPWORDS
     return True
 
 
@@ -296,19 +509,44 @@ def _resolve_context_filters(question: str, explicit_filters: list[str] | None =
     return [], None
 
 
+def _crosses_app_boundary(G: nx.Graph, u: str, v: str) -> bool:
+    """True if `u` and `v` have different, both-known `al_owning_app` tags
+    (bc-code-atlas #27). Neither missing-tag node (non-AL corpus, or a file
+    with no discoverable app.json) counts as crossing anything -- an unknown
+    boundary is not a confirmed one."""
+    au = G.nodes[u].get("al_owning_app")
+    av = G.nodes[v].get("al_owning_app")
+    return bool(au) and bool(av) and au != av
+
+
 def _filter_graph_by_context(G: nx.Graph, context_filters: list[str] | None) -> nx.Graph:
     filters = set(_normalize_context_filters(context_filters))
     if not filters:
         return G
+    # "cross_app" is a structural predicate (owning-app mismatch across the
+    # edge's two endpoints), not an edge `context`/relation-kind value like
+    # the rest of `filters` -- so it's split out and ANDed against whatever
+    # relation-kind filters remain, rather than joining the context
+    # whitelist it can never literally match (bc-code-atlas #27).
+    cross_app_only = "cross_app" in filters
+    relation_filters = filters - {"cross_app"}
     H = G.__class__()
     H.add_nodes_from(G.nodes(data=True))
+
+    def _keep(u: str, v: str, data: dict) -> bool:
+        if relation_filters and data.get("context") not in relation_filters:
+            return False
+        if cross_app_only and not _crosses_app_boundary(G, u, v):
+            return False
+        return True
+
     if isinstance(G, (nx.MultiGraph, nx.MultiDiGraph)):
         for u, v, key, data in G.edges(keys=True, data=True):
-            if data.get("context") in filters:
+            if _keep(u, v, data):
                 H.add_edge(u, v, key=key, **data)
     else:
         for u, v, data in G.edges(data=True):
-            if data.get("context") in filters:
+            if _keep(u, v, data):
                 H.add_edge(u, v, **data)
     return H
 
@@ -553,7 +791,30 @@ def _rank_scores(
     return _score_nodes(G, ranking_terms)
 
 
-def _find_node(G: nx.Graph, label: str) -> list[str]:
+class _NodeMatches(list):
+    """A `list[str]` (every existing caller's `matches[0]`/`if not matches`/
+    iteration keeps working unchanged) that additionally exposes how many
+    of the leading entries tied for the BEST match tier, via
+    `.top_tier_count`.
+
+    Needed for FR-005 (spec 004-al-object-labels): a query matching more
+    than one node in its best-matching tier is genuinely ambiguous (e.g. a
+    table and a page both named "Item") and callers that care should say
+    so, rather than silently taking `matches[0]`. This must be the *best*
+    tier, not always the exact tier specifically: since object labels now
+    carry type/ID tokens (spec 004), a bare-name query like "item" no
+    longer lands in the exact tier for either candidate (their full labels
+    are "Table 27 \"Item\"" / "Page 30 \"Item\"") -- both instead tie in the
+    substring tier, which is exactly where this ambiguity must still be
+    caught. A single top-tier match with additional looser matches behind
+    it in a lower tier is NOT ambiguous -- `top_tier_count` only counts
+    ties within whichever tier is actually winning.
+    """
+
+    top_tier_count: int = 0
+
+
+def _find_node(G: nx.Graph, label: str) -> _NodeMatches:
     """Return node IDs whose label or ID matches the search term (diacritic-insensitive).
 
     Results are ordered by three-tier precedence: exact match, then prefix match,
@@ -561,7 +822,7 @@ def _find_node(G: nx.Graph, label: str) -> list[str]:
     """
     term = " ".join(_search_tokens(label))
     if not term:
-        return []
+        return _NodeMatches()
     exact: list[str] = []
     prefix: list[str] = []
     substring: list[str] = []
@@ -581,7 +842,51 @@ def _find_node(G: nx.Graph, label: str) -> list[str]:
             prefix.append(nid)
         elif term in norm_label or term in label_tokens:
             substring.append(nid)
-    return exact + prefix + substring
+    result = _NodeMatches(exact + prefix + substring)
+    result.top_tier_count = len(exact) or len(prefix) or len(substring)
+    return result
+
+
+_GLOBAL_ID_RE = re.compile(r"^al://(?P<q>[^/]*)/(?P<t>[^/]*)/(?P<n>.*)$")
+
+
+def _al_global_id_type_name(global_id: str) -> tuple[str, str] | None:
+    """(type, name) parsed out of a `global_id`, ignoring its qualifier."""
+    m = _GLOBAL_ID_RE.match(global_id or "")
+    return (m.group("t"), m.group("n")) if m else None
+
+
+def _find_node_by_global_id(G: nx.Graph, global_id: str) -> list[str]:
+    """Node IDs matching `global_id` (bc-code-atlas #26).
+
+    `global_id` (`al://<qualifier>/<type>/<name>`) is a deterministic join key
+    computed so a stub in one corpus and the real object in another carry the
+    same value -- this is the resolver half of that: given a `global_id`
+    copied from one graph, find the matching node(s) on this one, for
+    cross-graph federation at query time.
+
+    Tries an exact match first. #31: two independently-built graphs can still
+    disagree on the qualifier for the same real object -- the referencing app
+    never imported the target's own `namespace` declaration, so its external
+    stub's `global_id` carries an empty qualifier while the object's own
+    corpus resolves a real one. When no exact match is found, fall back to
+    matching on type+name alone (safe in practice -- BC enforces object-name
+    uniqueness per type), so a caller handing over an unqualified/mismatched
+    `global_id` still gets a candidate instead of a hard miss.
+    """
+    term = (global_id or "").strip()
+    if not term:
+        return []
+    exact = [nid for nid, d in G.nodes(data=True) if d.get("global_id") == term]
+    if exact:
+        return exact
+    parsed = _al_global_id_type_name(term)
+    if not parsed:
+        return []
+    return [
+        nid for nid, d in G.nodes(data=True)
+        if _al_global_id_type_name(str(d.get("global_id", ""))) == parsed
+    ]
 
 
 def _filter_blank_stdin() -> None:
@@ -614,7 +919,13 @@ def _filter_blank_stdin() -> None:
     sys.stdin = open(0, "r", closefd=False)
 
 
-def _build_server(graph_path: str, *, instructions: str | None = None):
+def _build_server(
+    graph_path: str,
+    *,
+    instructions: str | None = None,
+    source_root: str | None = None,
+    data_root: str | None = None,
+):
     """Build the configured low-level MCP Server (shared by every transport).
 
     All graph query tools and resources are registered here over a single
@@ -627,8 +938,23 @@ def _build_server(graph_path: str, *, instructions: str | None = None):
     specific codebase) should pass their own description via this parameter
     (or ``--instructions``/``GRAPHIFY_INSTRUCTIONS`` on the CLI) so an agent
     with zero prior context knows what graph it's actually looking at.
+
+    ``source_root`` anchors bcatlas_get_signature/bcatlas_get_procedure_body/bcatlas_get_object_source,
+    which re-read the on-disk source a node points at (the graph itself only
+    stores file+line, not text). Defaults to ``graph_path``'s grandparent
+    (``<source_root>/<GRAPHIFY_OUT>/graph.json``), which matches every
+    existing deployment layout without needing an extra flag.
+
+    ``data_root`` (multi-tenant routing, T029) is the root under which
+    routed ``country``/``version`` tool arguments are resolved to a
+    different graph.json -- see ``_bcatlas_data_root``. Only consulted
+    when a tool call actually supplies both ``country`` and ``version``;
+    every tool's zero-argument behavior is unchanged and still serves the
+    one ``graph_path``/``source_root`` this function was called with.
     """
     import threading
+
+    _source_root = Path(source_root).resolve() if source_root else Path(graph_path).resolve().parent.parent
 
     try:
         from mcp.server import Server
@@ -675,13 +1001,39 @@ def _build_server(graph_path: str, *, instructions: str | None = None):
             communities = _communities_from_graph(new_G)
             _reload_state["mtime_ns"], _reload_state["size"] = key
 
+    def _resolve_ctx(arguments: dict) -> _RoutedGraph:
+        """The graph context for one tool call (T029).
+
+        Neither ``country`` nor ``version`` supplied -> this server's own
+        default graph, unchanged from before this change (the dispatcher
+        below already calls ``_maybe_reload()`` ahead of every handler, so
+        the default branch here doesn't need to call it again). Both
+        supplied -> that specific routed (country, version) pair's graph
+        (cached; see ``_load_routed_graph``). Exactly one supplied is a
+        caller error, not a guess.
+        """
+        country = arguments.get("country")
+        version = arguments.get("version")
+        if country is None and version is None:
+            return _RoutedGraph(
+                G=G, communities=communities, source_root=_source_root, graph_path=graph_path
+            )
+        if not country or not version:
+            raise _RoutingError(
+                "Both `country` and `version` must be supplied together to"
+                " query a specific (country, version) pair. Resolve an exact"
+                " version first (e.g. via the registry server's"
+                " bcatlas_resolve_version tool), then pass both."
+            )
+        return _load_routed_graph(country, version, data_root)
+
     server = Server("graphify", instructions=instructions)
 
     @server.list_tools()
     async def list_tools() -> list[types.Tool]:
         return [
             types.Tool(
-                name="query_graph",
+                name="bcatlas_query_graph",
                 description="Search the knowledge graph using BFS or DFS. Returns relevant nodes and edges as text context.",
                 inputSchema={
                     "type": "object",
@@ -694,32 +1046,46 @@ def _build_server(graph_path: str, *, instructions: str | None = None):
                         "context_filter": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Optional explicit edge-context filter, e.g. ['call', 'field']",
+                            "description": (
+                                "Optional explicit edge-context filter, e.g."
+                                " ['call', 'field']. Also accepts 'cross_app',"
+                                " a structural filter (not a relation kind) that"
+                                " keeps only edges whose two endpoints belong to"
+                                " different apps (AL corpora only) -- combine it"
+                                " with a relation kind (e.g. ['cross_app', 'call'])"
+                                " to see only cross-app calls, or use it alone"
+                                " for every cross-app edge regardless of kind."
+                            ),
                         },
+                        **_ROUTING_SCHEMA_PROPERTIES,
                     },
                     "required": ["question"],
                 },
             ),
             types.Tool(
-                name="get_node",
+                name="bcatlas_get_node",
                 description="Get full details for a specific node by label or ID.",
                 inputSchema={
                     "type": "object",
-                    "properties": {"label": {"type": "string", "description": "Node label or ID to look up"}},
+                    "properties": {
+                        "label": {"type": "string", "description": "Node label or ID to look up"},
+                        **_ROUTING_SCHEMA_PROPERTIES,
+                    },
                     "required": ["label"],
                 },
             ),
             types.Tool(
-                name="resolve_node",
+                name="bcatlas_resolve_node",
                 description=(
-                    "Deterministically resolve an AL symbol to its canonical node ID."
-                    " Pass the object type (table, page, codeunit, report, enum,"
-                    " tableextension, ...), the object name, and optionally a member"
-                    " (field, procedure or trigger name). Returns the matching node"
-                    " IDs with source anchors -- feed an ID into get_neighbors to"
-                    " traverse. PREFER this over get_node whenever you know what kind"
-                    " of thing you are looking for (get_node is fuzzy and may return"
-                    " a similarly named page control instead of the table)."
+                    "Deterministically resolve an AL symbol to its canonical node"
+                    " ID. Pass the object type (table, page, codeunit, report,"
+                    " enum, tableextension, ...), the object name, and optionally"
+                    " a member (field, procedure or trigger name). Returns the"
+                    " matching node IDs with source anchors -- feed an ID into"
+                    " bcatlas_get_neighbors to traverse. PREFER this over"
+                    " bcatlas_get_node whenever you know what kind of thing you"
+                    " are looking for (bcatlas_get_node is fuzzy and may return a"
+                    " similarly named page control instead of the table)."
                 ),
                 inputSchema={
                     "type": "object",
@@ -728,43 +1094,131 @@ def _build_server(graph_path: str, *, instructions: str | None = None):
                         "object_name": {"type": "string", "description": "Object name, e.g. 'VAT Posting Setup'"},
                         "member": {"type": "string", "description": "Optional field/procedure/trigger name, e.g. 'VAT Calculation Type' or 'FailIfVATPostingSetupHasVATEntries'"},
                         "limit": {"type": "integer", "default": 10, "description": "Max results"},
+                        **_ROUTING_SCHEMA_PROPERTIES,
                     },
                     "required": ["object_type", "object_name"],
                 },
             ),
             types.Tool(
-                name="get_neighbors",
+                name="bcatlas_find_by_global_id",
+                description=(
+                    "Cross-graph federation lookup: find the node(s) on THIS"
+                    " graph matching a `global_id` value copied from another"
+                    " graph's bcatlas_get_node output. `global_id` is a"
+                    " deterministic join key stamped on every AL node (real"
+                    " objects and external stubs alike), so a stub for object"
+                    " X in one corpus and the real X node in its own corpus"
+                    " share the same value -- use this to bridge two"
+                    " independently-hosted graphs at query time. Falls back to"
+                    " a type+name match when no exact match is found (the"
+                    " qualifier can legitimately differ between graphs), so"
+                    " an unqualified or mismatched `global_id` still returns"
+                    " candidates instead of a hard miss."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "global_id": {"type": "string", "description": "global_id value to look up, e.g. from another graph's bcatlas_get_node output"},
+                        **_ROUTING_SCHEMA_PROPERTIES,
+                    },
+                    "required": ["global_id"],
+                },
+            ),
+            types.Tool(
+                name="bcatlas_get_neighbors",
                 description="Get all direct neighbors of a node with edge details.",
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "label": {"type": "string"},
                         "relation_filter": {"type": "string", "description": "Optional: filter by relation type"},
+                        **_ROUTING_SCHEMA_PROPERTIES,
                     },
                     "required": ["label"],
                 },
             ),
             types.Tool(
-                name="get_community",
+                name="bcatlas_get_signature",
+                description=(
+                    "Lightweight ground-truth check: the exact declaration"
+                    " header (object header, or procedure/trigger signature"
+                    " with its return type) for a node, re-read from the real"
+                    " source file -- no body. Use this to confirm a"
+                    " search/graph hit is the right one before pulling the"
+                    " full body."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "label": {"type": "string", "description": "Node label or ID to look up"},
+                        **_ROUTING_SCHEMA_PROPERTIES,
+                    },
+                    "required": ["label"],
+                },
+            ),
+            types.Tool(
+                name="bcatlas_get_procedure_body",
+                description=(
+                    "Exact, full source text of one procedure/trigger, re-read"
+                    " from the real source file (not the index) -- signature,"
+                    " var declarations, and every line of the body. Errors if"
+                    " the node isn't inside a procedure/trigger; use"
+                    " bcatlas_get_object_source for object-level nodes."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "label": {"type": "string", "description": "Node label or ID to look up"},
+                        **_ROUTING_SCHEMA_PROPERTIES,
+                    },
+                    "required": ["label"],
+                },
+            ),
+            types.Tool(
+                name="bcatlas_get_object_source",
+                description=(
+                    "Exact, full source text of the object (table/page/"
+                    "codeunit/...) that a node belongs to, re-read from the"
+                    " real source file. Pass either the object's own node or"
+                    " any procedure inside it -- both resolve to the same"
+                    " object source."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "label": {"type": "string", "description": "Node label or ID to look up"},
+                        **_ROUTING_SCHEMA_PROPERTIES,
+                    },
+                    "required": ["label"],
+                },
+            ),
+            types.Tool(
+                name="bcatlas_get_community",
                 description="Get all nodes in a community by community ID.",
                 inputSchema={
                     "type": "object",
-                    "properties": {"community_id": {"type": "integer", "description": "Community ID (0-indexed by size)"}},
+                    "properties": {
+                        "community_id": {"type": "integer", "description": "Community ID (0-indexed by size)"},
+                        **_ROUTING_SCHEMA_PROPERTIES,
+                    },
                     "required": ["community_id"],
                 },
             ),
             types.Tool(
-                name="god_nodes",
+                name="bcatlas_god_nodes",
                 description="Return the most connected nodes - the core abstractions of the knowledge graph.",
-                inputSchema={"type": "object", "properties": {"top_n": {"type": "integer", "default": 10}}},
+                inputSchema={
+                    "type": "object",
+                    "properties": {"top_n": {"type": "integer", "default": 10}, **_ROUTING_SCHEMA_PROPERTIES},
+                },
             ),
             types.Tool(
-                name="graph_stats",
+                name="bcatlas_graph_stats",
                 description="Return summary statistics: node count, edge count, communities, confidence breakdown.",
-                inputSchema={"type": "object", "properties": {}},
+                inputSchema={"type": "object", "properties": {**_ROUTING_SCHEMA_PROPERTIES}},
             ),
             types.Tool(
-                name="shortest_path",
+                name="bcatlas_shortest_path",
                 description="Find the shortest path between two concepts in the knowledge graph.",
                 inputSchema={
                     "type": "object",
@@ -772,6 +1226,7 @@ def _build_server(graph_path: str, *, instructions: str | None = None):
                         "source": {"type": "string", "description": "Source concept label or keyword"},
                         "target": {"type": "string", "description": "Target concept label or keyword"},
                         "max_hops": {"type": "integer", "default": 8, "description": "Maximum hops to consider"},
+                        **_ROUTING_SCHEMA_PROPERTIES,
                     },
                     "required": ["source", "target"],
                 },
@@ -827,6 +1282,10 @@ def _build_server(graph_path: str, *, instructions: str | None = None):
     def _tool_query_graph(arguments: dict) -> str:
         import time as _time
         from graphify import querylog
+        try:
+            ctx = _resolve_ctx(arguments)
+        except _RoutingError as exc:
+            return str(exc)
         question = arguments["question"]
         mode = arguments.get("mode", "bfs")
         depth = min(int(arguments.get("depth", 3)), 6)
@@ -834,7 +1293,7 @@ def _build_server(graph_path: str, *, instructions: str | None = None):
         context_filter = arguments.get("context_filter")
         _t0 = _time.perf_counter()
         result = _query_graph_text(
-            G,
+            ctx.G,
             question,
             mode=mode,
             depth=depth,
@@ -844,7 +1303,7 @@ def _build_server(graph_path: str, *, instructions: str | None = None):
         querylog.log_query(
             kind="mcp_query",
             question=question,
-            corpus=str(graph_path),
+            corpus=str(ctx.graph_path),
             result=result,
             mode=mode,
             depth=depth,
@@ -853,39 +1312,62 @@ def _build_server(graph_path: str, *, instructions: str | None = None):
         )
         return result
 
-    def _node_card(nid: str, d: dict) -> str:
+    def _ambiguity_message(G: nx.Graph, matches: _NodeMatches) -> str:
+        # FR-005 (spec 004-al-object-labels): a query matching more than one
+        # node in the EXACT tier is genuinely ambiguous (e.g. a table and a
+        # page both named "Item") -- list the candidates by their full
+        # (now type+ID-qualified) label so the caller can retry
+        # unambiguously, rather than silently taking matches[0].
+        candidates = "\n".join(
+            f"  - {sanitize_label(G.nodes[nid].get('label', nid))} [id: {sanitize_label(nid)}]"
+            for nid in matches[: matches.top_tier_count]
+        )
+        return (
+            f"Multiple objects match:\n{candidates}\n"
+            "Retry with one of the node IDs shown above (labels can collide,"
+            " e.g. a table field and a same-named page control), or use"
+            " bcatlas_resolve_node with the object_type/object_name (and"
+            " optional member) for a deterministic match."
+        )
+
+    def _tool_get_node(arguments: dict) -> str:
+        try:
+            ctx = _resolve_ctx(arguments)
+        except _RoutingError as exc:
+            return str(exc)
+        label = arguments["label"].lower()
+        matches = _find_node(ctx.G, label)
+        if not matches:
+            return f"No node matching '{label}' found."
+        if matches.top_tier_count > 1:
+            return _ambiguity_message(ctx.G, matches)
+        nid = matches[0]
+        d = ctx.G.nodes[nid]
         # Sanitise every LLM-derived field before concatenation (F-010).
-        return "\n".join([
+        lines = [
             f"Node: {sanitize_label(d.get('label', nid))}",
             f"  ID: {sanitize_label(nid)}",
             f"  Source: {sanitize_label(str(d.get('source_file', '')))} {sanitize_label(str(d.get('source_location', '')))}",
             f"  Type: {sanitize_label(str(d.get('file_type', '')))}",
             f"  Community: {sanitize_label(str(d.get('community_name') or d.get('community', '')))}",
-            f"  Degree: {G.degree(nid)}",
-        ])
-
-    def _tool_get_node(arguments: dict) -> str:
-        label = arguments["label"]
-        matches = _find_node(G, label)
-        if not matches:
-            return f"No node matching '{label}' found."
-        # A fuzzy label like "VAT Posting Setup" legitimately matches a table
-        # AND page controls -- surface the ambiguity instead of silently
-        # returning an arbitrary first hit.
-        cards = [_node_card(nid, G.nodes[nid]) for nid in matches[:5]]
-        header = "" if len(matches) == 1 else (
-            f"{len(matches)} nodes match '{sanitize_label(label)}' -- top"
-            f" {len(cards)} below. If you know the object type, use"
-            " resolve_node for a deterministic match.\n\n"
-        )
-        return header + "\n\n".join(cards)
-
-    _ID_TOKEN = re.compile(r"[a-z0-9]+")
-
-    def _norm_id_segment(text: str) -> str:
-        return "_".join(_ID_TOKEN.findall(_strip_diacritics(str(text)).lower()))
+            f"  Degree: {ctx.G.degree(nid)}",
+        ]
+        # global_id/al_owning_app only exist on AL nodes (bc-code-atlas #26/#27)
+        # -- omitted rather than printed blank for every non-AL node/corpus.
+        global_id = d.get("global_id")
+        if global_id:
+            lines.append(f"  GlobalID: {sanitize_label(str(global_id))}")
+        owning_app = d.get("al_owning_app")
+        if owning_app:
+            lines.append(f"  OwningApp: {sanitize_label(str(owning_app))}")
+        return "\n".join(lines)
 
     def _tool_resolve_node(arguments: dict) -> str:
+        try:
+            ctx = _resolve_ctx(arguments)
+        except _RoutingError as exc:
+            return str(exc)
+        G = ctx.G
         obj_type = _norm_id_segment(arguments["object_type"])
         obj_name = _norm_id_segment(arguments["object_name"])
         member = _norm_id_segment(arguments.get("member") or "")
@@ -917,15 +1399,57 @@ def _build_server(graph_path: str, *, instructions: str | None = None):
                 " segments (case/punctuation-insensitive)."
             )
         ordered = exact + related
-        cards = [_node_card(nid, G.nodes[nid]) for nid in ordered[:limit]]
+
+        def _card(nid: str) -> str:
+            d = G.nodes[nid]
+            return "\n".join([
+                f"Node: {sanitize_label(d.get('label', nid))}",
+                f"  ID: {sanitize_label(nid)}",
+                f"  Source: {sanitize_label(str(d.get('source_file', '')))} {sanitize_label(str(d.get('source_location', '')))}",
+                f"  Type: {sanitize_label(str(d.get('file_type', '')))}",
+            ])
+
+        cards = [_card(nid) for nid in ordered[:limit]]
         note = "" if member or not related else (
             f"\n\n({len(related)} member nodes exist under this object --"
-            " pass member=... to resolve one, or get_neighbors on the object"
-            " ID to list contains-edges.)"
+            " pass member=... to resolve one, or bcatlas_get_neighbors on the"
+            " object ID to list contains-edges.)"
         )
         return "\n\n".join(cards) + note
 
-    def _qualified_label(nid: str) -> str:
+    def _tool_find_by_global_id(arguments: dict) -> str:
+        try:
+            ctx = _resolve_ctx(arguments)
+        except _RoutingError as exc:
+            return str(exc)
+        global_id = arguments["global_id"]
+        node_ids = _find_node_by_global_id(ctx.G, global_id)
+        if not node_ids:
+            return f"No node with global_id '{sanitize_label(global_id)}' found on this graph."
+        # #31: an empty result would have gone through the type+name fallback
+        # too, so any non-empty result here is exact only when its own
+        # global_id equals the query verbatim -- otherwise every node in it
+        # matched by type+name alone (qualifier differed), and the caller
+        # should know that's a lower-confidence resolution.
+        exact = ctx.G.nodes[node_ids[0]].get("global_id") == global_id
+        if exact:
+            lines = [f"{len(node_ids)} node(s) matching global_id '{sanitize_label(global_id)}':"]
+        else:
+            lines = [
+                f"global_id '{sanitize_label(global_id)}' not found exactly.",
+                f"{len(node_ids)} candidate(s) by type+name:",
+            ]
+        for nid in node_ids:
+            d = ctx.G.nodes[nid]
+            lines.append(
+                f"  {sanitize_label(d.get('label', nid))}"
+                f" (ID: {sanitize_label(nid)},"
+                f" Source: {sanitize_label(str(d.get('source_file', '')))}"
+                f" {sanitize_label(str(d.get('source_location', '')))})"
+            )
+        return "\n".join(lines)
+
+    def _qualified_label(G: nx.Graph, nid: str) -> str:
         """Member labels like '.OnValidate()' are ambiguous on their own --
         qualify them with their owner chain (field/procedure and object) so a
         traversal result reads 'OnValidate of "VAT Calculation Type" in table
@@ -953,20 +1477,27 @@ def _build_server(graph_path: str, *, instructions: str | None = None):
         return f"{sanitize_label(label)} of {chain}"
 
     def _tool_get_neighbors(arguments: dict) -> str:
+        try:
+            ctx = _resolve_ctx(arguments)
+        except _RoutingError as exc:
+            return str(exc)
+        G = ctx.G
         label = arguments["label"].lower()
         rel_filter = arguments.get("relation_filter", "").lower()
         matches = _find_node(G, label)
         if not matches:
             return f"No node matching '{label}' found."
+        if matches.top_tier_count > 1:
+            return _ambiguity_message(G, matches)
         nid = matches[0]
-        lines = [f"Neighbors of {_qualified_label(nid)} [id: {sanitize_label(nid)}]:"]
+        lines = [f"Neighbors of {_qualified_label(G, nid)} [id: {sanitize_label(nid)}]:"]
         for nb in G.successors(nid):
             d = edge_data(G, nid, nb)
             rel = d.get("relation", "")
             if rel_filter and rel_filter not in rel.lower():
                 continue
             lines.append(
-                f"  --> {_qualified_label(nb)} "
+                f"  --> {_qualified_label(G, nb)} "
                 f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]"
                 f" [id: {sanitize_label(nb)}]"
             )
@@ -976,20 +1507,67 @@ def _build_server(graph_path: str, *, instructions: str | None = None):
             if rel_filter and rel_filter not in rel.lower():
                 continue
             lines.append(
-                f"  <-- {_qualified_label(nb)} "
+                f"  <-- {_qualified_label(G, nb)} "
                 f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]"
                 f" [id: {sanitize_label(nb)}]"
             )
         return "\n".join(lines)
 
+    def _tool_source_lookup(ctx: _RoutedGraph, label: str, fn) -> str:
+        matches = _find_node(ctx.G, label.lower())
+        if not matches:
+            return f"No node matching '{label}' found."
+        if matches.top_tier_count > 1:
+            return _ambiguity_message(ctx.G, matches)
+        nid = matches[0]
+        d = ctx.G.nodes[nid]
+        source_file = d.get("source_file") or ""
+        if not source_file:
+            return f"Node '{sanitize_label(d.get('label', nid))}' has no associated source file."
+        try:
+            source_path = validate_graph_path(ctx.source_root / source_file, base=ctx.source_root)
+        except FileNotFoundError:
+            return f"Source file not found on disk: {source_file}"
+        except ValueError:
+            return f"Source path escapes the indexed source root: {source_file}"
+        try:
+            return fn(source_path, d.get("source_location"))
+        except source_lookup.SourceLookupError as exc:
+            return str(exc)
+
+    def _tool_get_signature(arguments: dict) -> str:
+        try:
+            ctx = _resolve_ctx(arguments)
+        except _RoutingError as exc:
+            return str(exc)
+        return _tool_source_lookup(ctx, arguments["label"], source_lookup.get_signature)
+
+    def _tool_get_procedure_body(arguments: dict) -> str:
+        try:
+            ctx = _resolve_ctx(arguments)
+        except _RoutingError as exc:
+            return str(exc)
+        return _tool_source_lookup(ctx, arguments["label"], source_lookup.get_procedure_body)
+
+    def _tool_get_object_source(arguments: dict) -> str:
+        try:
+            ctx = _resolve_ctx(arguments)
+        except _RoutingError as exc:
+            return str(exc)
+        return _tool_source_lookup(ctx, arguments["label"], source_lookup.get_object_source)
+
     def _tool_get_community(arguments: dict) -> str:
+        try:
+            ctx = _resolve_ctx(arguments)
+        except _RoutingError as exc:
+            return str(exc)
         cid = int(arguments["community_id"])
-        nodes = communities.get(cid, [])
+        nodes = ctx.communities.get(cid, [])
         if not nodes:
             return f"Community {cid} not found."
         lines = [f"Community {cid} ({len(nodes)} nodes):"]
         for n in nodes:
-            d = G.nodes[n]
+            d = ctx.G.nodes[n]
             # Sanitise label and source_file (F-010).
             lines.append(
                 f"  {sanitize_label(d.get('label', n))} "
@@ -998,25 +1576,39 @@ def _build_server(graph_path: str, *, instructions: str | None = None):
         return "\n".join(lines)
 
     def _tool_god_nodes(arguments: dict) -> str:
+        try:
+            ctx = _resolve_ctx(arguments)
+        except _RoutingError as exc:
+            return str(exc)
         from graphify.analyze import god_nodes as _god_nodes
-        nodes = _god_nodes(G, top_n=int(arguments.get("top_n", 10)))
+        nodes = _god_nodes(ctx.G, top_n=int(arguments.get("top_n", 10)))
         lines = ["God nodes (most connected):"]
         lines += [f"  {i}. {n['label']} - {n['degree']} edges" for i, n in enumerate(nodes, 1)]
         return "\n".join(lines)
 
-    def _tool_graph_stats(_: dict) -> str:
+    def _tool_graph_stats(arguments: dict) -> str:
+        try:
+            ctx = _resolve_ctx(arguments)
+        except _RoutingError as exc:
+            return str(exc)
+        G = ctx.G
         confs = [d.get("confidence", "EXTRACTED") for _, _, d in G.edges(data=True)]
         total = len(confs) or 1
         return (
             f"Nodes: {G.number_of_nodes()}\n"
             f"Edges: {G.number_of_edges()}\n"
-            f"Communities: {len(communities)}\n"
+            f"Communities: {len(ctx.communities)}\n"
             f"EXTRACTED: {round(confs.count('EXTRACTED')/total*100)}%\n"
             f"INFERRED: {round(confs.count('INFERRED')/total*100)}%\n"
             f"AMBIGUOUS: {round(confs.count('AMBIGUOUS')/total*100)}%\n"
         )
 
     def _tool_shortest_path(arguments: dict) -> str:
+        try:
+            ctx = _resolve_ctx(arguments)
+        except _RoutingError as exc:
+            return str(exc)
+        G = ctx.G
         src_scored = _score_nodes(G, [t.lower() for t in arguments["source"].split()])
         tgt_scored = _score_nodes(G, [t.lower() for t in arguments["target"].split()])
         if not src_scored:
@@ -1157,14 +1749,18 @@ def _build_server(graph_path: str, *, instructions: str | None = None):
         return "\n\n".join(lines)
 
     _handlers = {
-        "query_graph": _tool_query_graph,
-        "get_node": _tool_get_node,
-        "resolve_node": _tool_resolve_node,
-        "get_neighbors": _tool_get_neighbors,
-        "get_community": _tool_get_community,
-        "god_nodes": _tool_god_nodes,
-        "graph_stats": _tool_graph_stats,
-        "shortest_path": _tool_shortest_path,
+        "bcatlas_query_graph": _tool_query_graph,
+        "bcatlas_get_node": _tool_get_node,
+        "bcatlas_resolve_node": _tool_resolve_node,
+        "bcatlas_find_by_global_id": _tool_find_by_global_id,
+        "bcatlas_get_neighbors": _tool_get_neighbors,
+        "bcatlas_get_signature": _tool_get_signature,
+        "bcatlas_get_procedure_body": _tool_get_procedure_body,
+        "bcatlas_get_object_source": _tool_get_object_source,
+        "bcatlas_get_community": _tool_get_community,
+        "bcatlas_god_nodes": _tool_god_nodes,
+        "bcatlas_graph_stats": _tool_graph_stats,
+        "bcatlas_shortest_path": _tool_shortest_path,
         "list_prs": _tool_list_prs,
         "get_pr_impact": _tool_get_pr_impact,
         "triage_prs": _tool_triage_prs,
@@ -1256,7 +1852,13 @@ def _build_server(graph_path: str, *, instructions: str | None = None):
     return server
 
 
-def serve(graph_path: str | None = None, *, instructions: str | None = None) -> None:
+def serve(
+    graph_path: str | None = None,
+    *,
+    instructions: str | None = None,
+    source_root: str | None = None,
+    data_root: str | None = None,
+) -> None:
     """Start the MCP server over stdio (the default, per-developer transport)."""
     graph_path = graph_path or _default_graph_json()
     try:
@@ -1265,7 +1867,9 @@ def serve(graph_path: str | None = None, *, instructions: str | None = None) -> 
         raise ImportError('mcp not installed. Run: pip install "graphifyy[mcp]"') from e
     import asyncio
 
-    server = _build_server(graph_path, instructions=instructions)
+    server = _build_server(
+        graph_path, instructions=instructions, source_root=source_root, data_root=data_root
+    )
 
     async def main() -> None:
         async with stdio_server() as streams:
@@ -1343,6 +1947,8 @@ def _build_http_app(
     stateless: bool = False,
     session_timeout: float | None = 3600.0,
     instructions: str | None = None,
+    source_root: str | None = None,
+    data_root: str | None = None,
 ):
     """Build the Starlette ASGI app for the Streamable HTTP transport.
 
@@ -1373,7 +1979,9 @@ def _build_http_app(
     # mistaken for "auth on" — normalize it to None so the gate is unambiguous.
     api_key = (api_key or "").strip() or None
 
-    server = _build_server(graph_path, instructions=instructions)
+    server = _build_server(
+        graph_path, instructions=instructions, source_root=source_root, data_root=data_root
+    )
 
     # DNS-rebinding protection. When the operator binds a wildcard address they
     # are intentionally exposing the server, so accept any Host header; for a
@@ -1426,6 +2034,8 @@ def serve_http(
     stateless: bool = False,
     session_timeout: float | None = 3600.0,
     instructions: str | None = None,
+    source_root: str | None = None,
+    data_root: str | None = None,
 ) -> None:
     """Start the MCP server over Streamable HTTP (MCP spec 2025-03-26).
 
@@ -1459,6 +2069,8 @@ def serve_http(
         stateless=stateless,
         session_timeout=session_timeout,
         instructions=instructions,
+        source_root=source_root,
+        data_root=data_root,
     )
 
     auth_note = "api-key required" if api_key else "no auth (set --api-key to require one)"
@@ -1537,6 +2149,30 @@ def _main(argv: list[str] | None = None) -> None:
             "looking at."
         ),
     )
+    parser.add_argument(
+        "--source-root",
+        default=os.environ.get("GRAPHIFY_SOURCE_ROOT"),
+        help=(
+            "Root directory that source_file paths in graph.json are relative"
+            " to (env: GRAPHIFY_SOURCE_ROOT). Used by bcatlas_get_signature/"
+            " bcatlas_get_procedure_body/bcatlas_get_object_source to re-read exact source."
+            " Defaults to graph_path's grandparent directory, which matches"
+            " every existing deployment layout."
+        ),
+    )
+    parser.add_argument(
+        "--data-root",
+        default=os.environ.get("GRAPHIFY_BCATLAS_DATA_ROOT"),
+        help=(
+            "Root under which multi-tenant routed country/version graphs"
+            " live, as `<data-root>/warm/<country>/<version>/graph/graph.json`"
+            " (env: GRAPHIFY_BCATLAS_DATA_ROOT). Only consulted when a tool"
+            " call supplies both `country` and `version` -- every tool's"
+            " zero-argument behavior is unaffected. Defaults to `<repo"
+            " root>/data`, matching bc-code-atlas's own layout convention"
+            " (build/build/layout.py)."
+        ),
+    )
     args = parser.parse_args(argv)
     graph_path = args.graph_flag or args.graph_path or _default_graph_json()
 
@@ -1551,9 +2187,16 @@ def _main(argv: list[str] | None = None) -> None:
             stateless=args.stateless,
             session_timeout=args.session_timeout,
             instructions=args.instructions,
+            source_root=args.source_root,
+            data_root=args.data_root,
         )
     else:
-        serve(graph_path, instructions=args.instructions)
+        serve(
+            graph_path,
+            instructions=args.instructions,
+            source_root=args.source_root,
+            data_root=args.data_root,
+        )
 
 
 if __name__ == "__main__":

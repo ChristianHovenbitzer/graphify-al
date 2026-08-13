@@ -3326,14 +3326,31 @@ def main() -> None:
     elif cmd == "update":
         force = os.environ.get("GRAPHIFY_FORCE", "").lower() in ("1", "true", "yes")
         no_cluster = False
+        no_report = False
+        changed_paths_file: str | None = None
         args = sys.argv[2:]
         watch_arg: str | None = None
-        for a in args:
+        i = 0
+        while i < len(args):
+            a = args[i]
             if a == "--force":
                 force = True
+                i += 1
                 continue
             if a == "--no-cluster":
                 no_cluster = True
+                i += 1
+                continue
+            if a == "--no-report":
+                no_report = True
+                i += 1
+                continue
+            if a == "--changed-paths-file":
+                if i + 1 >= len(args):
+                    print("error: --changed-paths-file requires a path argument", file=sys.stderr)
+                    sys.exit(2)
+                changed_paths_file = args[i + 1]
+                i += 2
                 continue
             if a.startswith("-"):
                 print(f"error: unknown update option: {a}", file=sys.stderr)
@@ -3342,6 +3359,7 @@ def main() -> None:
                 print("error: update accepts at most one path argument", file=sys.stderr)
                 sys.exit(2)
             watch_arg = a
+            i += 1
 
         if watch_arg is not None:
             watch_path = Path(watch_arg)
@@ -3357,11 +3375,36 @@ def main() -> None:
             sys.exit(1)
         from graphify.watch import _rebuild_code
 
+        # --changed-paths-file is opt-in and additive: omitting it preserves
+        # every existing caller's behavior (full-corpus re-extraction,
+        # changed_paths=None) exactly as before -- including the post-checkout
+        # hook (graphify/hooks.py's _REBUILD_BODY_CHECKOUT), which deliberately
+        # always wants a full rebuild since a branch switch can touch arbitrary
+        # files. Only a caller that explicitly knows its exact changed-file set
+        # (this project's own build pipeline, comparing two known commits) opts
+        # into the incremental path.
+        changed_paths: list[Path] | None = None
+        if changed_paths_file is not None:
+            changed_file = Path(changed_paths_file)
+            if not changed_file.is_file():
+                print(f"error: --changed-paths-file not found: {changed_file}", file=sys.stderr)
+                sys.exit(1)
+            changed_paths = [
+                Path(line) for line in changed_file.read_text(encoding="utf-8").splitlines() if line.strip()
+            ]
+
         print(f"Re-extracting code files in {watch_path} (no LLM needed)...")
         # Interactive CLI: block on the per-repo lock rather than skip, so the
         # user sees their explicit `graphify update` complete instead of
         # exiting silently when a hook-driven rebuild happens to be running.
-        ok = _rebuild_code(watch_path, force=force, no_cluster=no_cluster, block_on_lock=True)
+        ok = _rebuild_code(
+            watch_path,
+            changed_paths=changed_paths,
+            force=force,
+            no_cluster=no_cluster,
+            no_report=no_report,
+            block_on_lock=True,
+        )
         if ok:
             print("Code graph updated. For doc/paper/image changes run /graphify --update in your AI assistant.")
             if not (

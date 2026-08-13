@@ -73,7 +73,7 @@ def test_subpage_edge_resolves_to_target_page_and_attaches_to_part_member(tmp_pa
 
     part_member = next(n["id"] for n in result["nodes"] if n["label"] == ".Details")
     target_page = next(n["id"] for n in result["nodes"]
-                       if n["label"] == '"Widget Detail FactBox"')
+                       if n["label"] == 'Page 50101 "Widget Detail FactBox"')
 
     edges = _subpage_edges(result)
     assert len(edges) == 1

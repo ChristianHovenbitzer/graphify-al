@@ -65,7 +65,7 @@ def test_report_dataitem_and_columns_are_member_nodes(tmp_path):
     p.write_text(_REPORT, encoding="utf-8")
     result = extract_al(p)
 
-    report = _member(result, '"Cust List"')
+    report = _member(result, 'Report 50000 "Cust List"')
     dataitem = _member(result, ".Cust")
 
     # The dataitem hangs off the report object; the columns hang off the dataitem.
@@ -152,7 +152,7 @@ def test_query_dataitem_and_column_source(tmp_path):
 
     result = extract([qry, cust], cache_root=tmp_path)
 
-    query = _member(result, '"Cust Query"')
+    query = _member(result, 'Query 50002 "Cust Query"')
     dataitem = _member(result, ".Cust")
     col = _member(result, ".CName")
     name_fld = _member(result, ".Name")

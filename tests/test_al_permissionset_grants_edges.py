@@ -71,7 +71,7 @@ def test_grants_edge_resolves_to_target_node_with_mask(tmp_path):
 
     result = extract([pset, tbl], cache_root=tmp_path)
 
-    order_obj = next(n["id"] for n in result["nodes"] if n["label"] == '"My Order"')
+    order_obj = next(n["id"] for n in result["nodes"] if n["label"] == 'Table 50101 "My Order"')
     pset_src = next(e["source"] for e in _grant_edges(result))
 
     grants = _grant_edges(result)

@@ -298,6 +298,56 @@ def test_update_no_cluster_writes_raw_graph(tmp_path):
     assert all("community" not in node for node in data["nodes"])
 
 
+def _node_names(data: dict) -> set[str]:
+    return {n["id"] for n in data["nodes"]}
+
+
+def test_update_changed_paths_file_preserves_unchanged_nodes(tmp_path):
+    """bcatlas's own addition: `graphify update --changed-paths-file <file>`
+    forwards the list to `_rebuild_code`'s `changed_paths` param (previously
+    only reachable from graphify's git hooks, not this CLI command). Only
+    the file actually listed should be re-extracted; the node for the
+    untouched sibling file must survive from the prior full build rather
+    than being dropped.
+    """
+    src_a = tmp_path / "a.py"
+    src_a.write_text("def alpha():\n    return 1\n", encoding="utf-8")
+    src_b = tmp_path / "b.py"
+    src_b.write_text("def beta():\n    return 2\n", encoding="utf-8")
+
+    full = _run(["update", ".", "--no-cluster"], tmp_path)
+    assert full.returncode == 0, full.stderr
+    graph_path = tmp_path / "graphify-out" / "graph.json"
+    before = json.loads(graph_path.read_text(encoding="utf-8"))
+    names_before = _node_names(before)
+    alpha_ids_before = {n for n in names_before if "alpha" in n}
+    assert alpha_ids_before
+    assert any("beta" in n for n in names_before)
+
+    # Only b.py actually changed; a.py's node should be preserved untouched.
+    src_b.write_text("def beta():\n    return 999\n", encoding="utf-8")
+    changed_file = tmp_path / "changed.txt"
+    changed_file.write_text("b.py\n", encoding="utf-8")
+
+    r = _run(["update", ".", "--no-cluster", "--changed-paths-file", str(changed_file)], tmp_path)
+    assert r.returncode == 0, r.stderr
+
+    after = json.loads(graph_path.read_text(encoding="utf-8"))
+    names_after = _node_names(after)
+    assert any("beta" in n for n in names_after)
+    # alpha's node id is the preserved one from the first build (not
+    # re-extracted) -- a.py was never listed in --changed-paths-file, so it
+    # must survive untouched rather than being dropped from the graph.
+    assert alpha_ids_before <= names_after
+
+
+def test_update_changed_paths_file_missing_errors(tmp_path):
+    src = tmp_path / "sample.py"
+    src.write_text("def f():\n    return 1\n", encoding="utf-8")
+    r = _run(["update", ".", "--changed-paths-file", str(tmp_path / "nope.txt")], tmp_path)
+    assert r.returncode != 0
+
+
 # Regression test for #934 - cluster-only crashes when graphify-out/ doesn't exist
 
 def test_cluster_only_creates_output_dir_when_missing(tmp_path):

@@ -31,8 +31,11 @@ def _obj_nodes(result: dict) -> list[dict]:
 
 
 def _by_name(result: dict, name: str) -> dict:
+    # Real object nodes carry the bare name separately in `al_object_name`
+    # (`label` is now the full type+ID+name canonical reference, spec
+    # 004-al-object-labels).
     for n in _obj_nodes(result):
-        if str(n.get("label", "")).strip('"').lower() == name.lower():
+        if str(n.get("al_object_name", "")).lower() == name.lower():
             return n
     raise AssertionError(f"object {name!r} not found")
 
@@ -149,3 +152,117 @@ def test_global_id_empty_qualifier_when_no_namespace_and_no_app_json(tmp_path: P
     node = _by_name(result, "Bare Mgt")
     # No namespace and no app.json -> empty qualifier, but still a valid key.
     assert node["global_id"] == "al:///codeunit/bare mgt"
+
+
+# (d) #31: BC allows a table and a codeunit to share a bare name (e.g. the base
+# app's Table 308 "No. Series" / Codeunit "No. Series"). Two out-of-corpus
+# references that disagree on type -- a permission grant on the codeunit, a
+# tableextension's base on the table -- must land on DISTINCT stubs, not merge
+# into whichever one the extraction happened to visit first.
+def test_type_colliding_external_refs_get_distinct_stubs(tmp_path: Path):
+    result = _build(tmp_path, "app", {
+        "MySet.PermissionSet.al": (
+            'permissionset 50100 "My Set"\n'
+            '{ Permissions = codeunit "No. Series" = X; }\n'
+        ),
+        "NoSeriesExt.TableExt.al": (
+            'tableextension 50100 "No Series Ext" extends "No. Series"\n'
+            '{ fields { field(50100; "Extra"; Integer) { } } }\n'
+        ),
+    })
+    stubs = [n for n in _externals(result)
+             if str(n.get("label", "")).strip('"').lower() == "no. series"]
+    types = {n.get("al_object_type") for n in stubs}
+    assert types == {"codeunit", "table"}, (
+        f"expected distinct table/codeunit stubs for the shared bare name, got {stubs}"
+    )
+    ids = {n["id"] for n in stubs}
+    assert len(ids) == 2, f"distinct types must not collapse to one stub id, got {ids}"
+    gids = {n.get("global_id") for n in stubs}
+    assert len(gids) == 2, f"distinct types must carry distinct global_ids, got {gids}"
+
+
+# (e) #31: a call into an out-of-corpus object's specific procedure must mint a
+# per-member stub (`Object.Method`), not collapse to an object-level stub --
+# so the exact procedure referenced survives a cross-app/cross-graph boundary
+# instead of being recoverable only by re-reading the caller's source by hand.
+def test_call_into_external_object_mints_per_member_stub(tmp_path: Path):
+    result = _build(tmp_path, "app", {
+        "Test.Codeunit.al": (
+            'codeunit 50100 "Test"\n'
+            "{\n"
+            "    var\n"
+            '        NoSeriesMgt: Codeunit "No. Series";\n\n'
+            "    procedure GenerateDocumentNo()\n"
+            "    begin\n"
+            "        NoSeriesMgt.GetNextNo('X', WorkDate());\n"
+            "    end;\n"
+            "}\n"
+        ),
+    })
+    member_stubs = [n for n in _externals(result)
+                    if str(n.get("label", "")).lower() == "no. series.getnextno"]
+    assert len(member_stubs) == 1, f"expected one per-member stub, got {_externals(result)}"
+    member_id = member_stubs[0]["id"]
+
+    calls = [e for e in result["edges"] if e["relation"] == "calls"]
+    assert any(e["target"] == member_id for e in calls), (
+        "calls edge into the out-of-corpus procedure must target its per-member"
+        f" stub, got targets {[e['target'] for e in calls]}"
+    )
+    # The object-level stub, if minted at all elsewhere, must stay a separate
+    # node -- the calls edge must never land back on the whole-object stub.
+    obj_stubs = [n for n in _externals(result)
+                 if str(n.get("label", "")).strip('"').lower() == "no. series"]
+    assert all(n["id"] != member_id for n in obj_stubs)
+
+
+# (f) #33 follow-up to (e): the per-member stub minted for a call into an
+# out-of-corpus object must carry `al_object_type` (known from the call
+# site's own declared variable type) and a fully-typed `global_id`, not an
+# empty type segment -- else two differently-typed objects sharing a bare
+# name and a same-named method would collide on the same member stub.
+def test_call_into_external_object_member_stub_is_typed(tmp_path: Path):
+    result = _build(tmp_path, "app", {
+        "Test.Codeunit.al": (
+            'codeunit 50100 "Test"\n'
+            "{\n"
+            "    var\n"
+            '        NoSeriesMgt: Codeunit "No. Series";\n\n'
+            "    procedure GenerateDocumentNo()\n"
+            "    begin\n"
+            "        NoSeriesMgt.GetNextNo('X', WorkDate());\n"
+            "    end;\n"
+            "}\n"
+        ),
+    })
+    member_stub = next(
+        n for n in _externals(result)
+        if str(n.get("label", "")).lower() == "no. series.getnextno"
+    )
+    assert member_stub.get("al_object_type") == "codeunit"
+    assert member_stub.get("global_id") == "al:///codeunit/no. series.getnextno"
+
+
+# (g) #33: same typing fix for a subscribes edge onto an out-of-corpus
+# publisher -- the `[EventSubscriber(ObjectType::X, ...)]` attribute's own
+# publisher type carries onto the per-member stub, exactly mirroring (f).
+def test_subscribe_to_external_publisher_member_stub_is_typed(tmp_path: Path):
+    result = _build(tmp_path, "app", {
+        "Test.Codeunit.al": (
+            'codeunit 50100 "Test"\n'
+            "{\n"
+            '    [EventSubscriber(ObjectType::Codeunit, Codeunit::"Sales-Post",'
+            " 'OnAfterPostSalesDoc', '', false, false)]\n"
+            "    local procedure OnAfterPostSalesDoc()\n"
+            "    begin\n"
+            "    end;\n"
+            "}\n"
+        ),
+    })
+    member_stub = next(
+        n for n in _externals(result)
+        if str(n.get("label", "")).lower() == "sales-post.onafterpostsalesdoc"
+    )
+    assert member_stub.get("al_object_type") == "codeunit"
+    assert member_stub.get("global_id") == "al:///codeunit/sales-post.onafterpostsalesdoc"
