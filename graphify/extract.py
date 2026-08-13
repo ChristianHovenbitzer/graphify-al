@@ -6315,6 +6315,7 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
 
     new_edges: list[dict] = []
     seen: set = set()
+    edges_by_pair: dict[tuple, dict] = {}
     for result in per_file:
         if not isinstance(result, dict):
             continue
