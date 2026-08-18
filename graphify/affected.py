@@ -29,6 +29,9 @@ DEFAULT_AFFECTED_RELATIONS = (
     "mixes_in",
     "embeds",
     "requires",
+    # AL record DML (`SalesLine.DeleteAll()`): a procedure that writes rows of a
+    # table is affected by that table, exactly like a caller or an extender.
+    "mutates",
 )
 
 

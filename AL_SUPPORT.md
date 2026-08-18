@@ -48,6 +48,7 @@ are `.ProcName()`. `examples/` has a tiny synthetic app you can build and query 
 | `extends` | `tableextension` / `pageextension` / etc. → its base object |
 | `binds` | page `SourceTable`, report/query `dataitem`, xmlport `tableelement` → the table it binds |
 | `usercontrol` | page/pageextension `usercontrol(<ctrl>; <AddIn>)` → the control add-in it embeds; `CurrPage.<ctrl>.<proc>()` calls resolve to that add-in's procedure via the control→add-in map |
+| `mutates` | record DML on a Record-typed variable (`SalesLine.DeleteAll(true)`) → the TABLE the variable is typed as. Carries `operation` (`Insert`/`Modify`/`Delete`/`DeleteAll`/`ModifyAll`/`Rename`/`Validate`/`TransferFields`/`Init`) and `run_trigger` when the call passes a boolean literal. Answers "which procedure deletes/inserts records of table X" — invisible to `accesses_field` (fields) and `calls` (procedures). Local vars, globals and parameters all resolve; tables outside the corpus become tagged `external` nodes |
 | `relates_to` | a field's `TableRelation` → the foreign-key target table(s) |
 | `computes_from` | a table's FlowField `CalcFormula` (`Sum`/`Count`/`Exist`/`Lookup`/`Average`/`Min`/`Max`) → the source table it aggregates (source field kept on the edge; tables outside the corpus become tagged `external` nodes) |
 | `implements` | object → each interface in its `implements` clause; an enum value's `Implementation = IFace = Impl` also links the concrete impl (`enum_binds_implementation`) and that impl → the interface |

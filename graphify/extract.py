@@ -5249,6 +5249,22 @@ _AL_OBJ_TYPE_RE = re.compile(
 _AL_CODEUNIT_CLASSES = frozenset({"codeunit"})
 _AL_USES_CLASSES = frozenset({"record", "page", "report", "query", "xmlport"})
 
+# Record DML on a Record-typed variable: `SalesLine.DeleteAll(true)` writes rows of
+# the table the variable is typed as. Field reads/writes (`accesses_field`) and
+# procedure calls (`calls`) never expose this, so "which procedure deletes records
+# of table X" was unanswerable from the graph. Maps the AL method name to the
+# canonical operation carried on the resulting `mutates` edge.
+_AL_DML_OPS = {
+    "insert": "Insert", "modify": "Modify", "delete": "Delete",
+    "deleteall": "DeleteAll", "modifyall": "ModifyAll", "rename": "Rename",
+    "validate": "Validate", "transferfields": "TransferFields", "init": "Init",
+}
+# Operations whose signature carries a RunTrigger boolean; for the *All forms it is
+# the LAST boolean argument (`ModifyAll(Fld, Val, true)`), for the rest the only one.
+_AL_DML_RUNTRIGGER_OPS = frozenset({
+    "insert", "modify", "delete", "deleteall", "modifyall",
+})
+
 # Built-in indirect dispatch: Codeunit.Run(Codeunit::"X"), Page.RunModal(Page::"Y"),
 # Report.Run(Report::"Z"). The object keyword parses as a `keyword_identifier`.
 _AL_RUN_KEYWORDS = frozenset({"codeunit", "page", "report"})
@@ -5517,6 +5533,22 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                                               "target": addin, "method": text(mem)})
                     elif ob.type == "identifier":
                         hit = varmap.get(text(ob).lower())
+                        op = _AL_DML_OPS.get(text(mem).lower())
+                        if op and hit and hit[0] == "record":
+                            # `<RecVar>.<Insert|Modify|Delete|...>(...)` - a write
+                            # against the table the variable is typed as. Emitted in
+                            # ADDITION to any other fact this call produces (e.g.
+                            # TransferFields also yields `transfers_to`).
+                            fact = {"kind": "mutates", "src_line": proc_line,
+                                    "target": hit[1], "operation": op}
+                            if text(mem).lower() in _AL_DML_RUNTRIGGER_OPS:
+                                args = node.child_by_field_name("arguments")
+                                bools = [text(a).lower() for a in (args.children if args
+                                                                   is not None else ())
+                                         if a.type == "boolean"]
+                                if bools:
+                                    fact["run_trigger"] = bools[-1] == "true"
+                            facts.append(fact)
                         if hit and hit[0] in _AL_CODEUNIT_CLASSES:
                             facts.append({"kind": "calls", "src_line": proc_line,
                                           "target": hit[1], "method": text(mem),
@@ -6504,6 +6536,16 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
         obj_by_name.setdefault(key, n["id"])
         obj_ids_by_name.setdefault(key, []).append(n["id"])
 
+    # Object names are unique per object TYPE, not globally - real BC apps do ship a
+    # codeunit and a table under the same name. `obj_by_name` keeps whichever file
+    # was seen first, so a `Record "X"` reference can land on the same-named
+    # codeunit. A record type is a table by construction - resolve it type-first.
+    table_by_name: dict[str, str] = {}
+    for n in objnodes:
+        if str(n.get("al_object_type", "")).lower() == "table":
+            table_by_name.setdefault(_al_strip_quotes(n.get("label", "")).lower(),
+                                     n["id"])
+
     objids = sorted((n["id"] for n in objnodes), key=len, reverse=True)
     proc_by_objmeth: dict[tuple, str] = {}
     for n in al_nodes:
@@ -6732,6 +6774,56 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
                                 "confidence_score": 0.9, "source_file": sf,
                                 "source_location": f"L{f.get('src_line', '')}", "weight": 1.0,
                             })
+                continue
+            if f["kind"] == "accesses_field":
+                # procedure -> field of the declared table
+                src = line2nid.get(f.get("src_line"))
+                tname = f.get("target")
+                fld = f.get("field")
+                if src and tname and fld:
+                    tgt = resolve_field(tname, fld)
+                    if src != tgt:
+                        mode = f.get("mode", "read")
+                        pair = (src, tgt, "accesses_field", mode)
+                        if pair not in seen:
+                            seen.add(pair)
+                            new_edges.append({
+                                "source": src, "target": tgt, "relation": "accesses_field",
+                                "mode": mode,
+                                "context": f"al_field_{mode}", "confidence": "EXTRACTED",
+                                "confidence_score": 0.9, "source_file": sf,
+                                "source_location": f"L{f.get('src_line', '')}", "weight": 1.0,
+                            })
+                continue
+            if f["kind"] == "mutates":
+                # procedure/trigger -> the TABLE its record variable is typed as,
+                # tagged with the DML operation (and RunTrigger when the call passes
+                # a boolean literal). Answers "who deletes/inserts records of X".
+                # An out-of-corpus table falls back to a tagged external stub; an
+                # unresolvable record type produced no fact in the first place.
+                src = line2nid.get(f.get("src_line"))
+                tname = f.get("target")
+                if src and tname:
+                    tkey = _al_strip_quotes(tname).lower()
+                    tgt = (table_by_name.get(tkey) or obj_by_name.get(tkey)
+                           or ensure_external(tname, src_qualifier, "table"))
+                    op = str(f.get("operation", ""))
+                    if src != tgt:
+                        pair = (src, tgt, "mutates", op)
+                        if pair not in seen:
+                            seen.add(pair)
+                            edge = {
+                                "source": src, "target": tgt, "relation": "mutates",
+                                "operation": op,
+                                "context": f"al_mutates_{op.lower()}",
+                                "confidence": "EXTRACTED", "confidence_score": 0.9,
+                                "source_file": sf,
+                                "source_location": f"L{f.get('src_line', '')}",
+                                "weight": 1.0,
+                            }
+                            if "run_trigger" in f:
+                                edge["run_trigger"] = bool(f["run_trigger"])
+                            new_edges.append(edge)
                 continue
             if f["kind"] == "sources_field":
                 # query column / xmlport fieldelement -> source field node. Source
