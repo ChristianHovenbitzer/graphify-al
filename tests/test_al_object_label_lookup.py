@@ -2,16 +2,16 @@
 
 Covers US1 (a query using the natural, canonical AL reference now resolves;
 a bare-name query still resolves too -- FR-004, no regression) and US2 (a
-bare-name query matching multiple same-named objects of different types is
-reported as ambiguous via `_find_node`'s new `top_tier_count`, rather than
-silently returning one arbitrary candidate -- FR-005).
+bare-name query matching multiple same-named objects of different types,
+in different files, is reported as ambiguous via `find_node_ambiguity`,
+rather than silently returning one arbitrary candidate -- FR-005).
 
-Exercises `_find_node` directly (the shared matching primitive behind
-`bcatlas_get_node`/`get_neighbors`/`get_signature`/`get_procedure_body`/
-`get_object_source`) rather than the full MCP server, since the tool
-functions are nested closures inside `serve()` with no existing
-unit-test seam -- `_find_node` is the actual load-bearing new behavior
-(the `top_tier_count` disambiguation signal) and is directly importable.
+Exercises `_find_node`/`find_node_ambiguity` directly (the shared matching
+primitives behind `bcatlas_get_node`/`get_neighbors`/`get_signature`/
+`get_procedure_body`/`get_object_source`) rather than the full MCP server,
+since the tool functions are nested closures inside `serve()` with no
+existing unit-test seam -- these are the actual load-bearing new behavior
+(the cross-file ambiguity signal) and are directly importable.
 
 Fixture files are deliberately named without the object's own name in the
 filename (`ObjA.al`, not `Item.Table.al`) -- a bare-name query like "item"
@@ -30,7 +30,7 @@ pytest.importorskip("tree_sitter_al")
 
 from graphify.build import build_from_json  # noqa: E402
 from graphify.extract import extract  # noqa: E402
-from graphify.serve import _find_node  # noqa: E402
+from graphify.serve import _find_node, find_node_ambiguity  # noqa: E402
 
 
 def _write(tmp_path: Path, name: str, text: str) -> Path:
@@ -45,7 +45,7 @@ def test_full_canonical_reference_resolves(tmp_path: Path) -> None:
     G = build_from_json(result)
 
     matches = _find_node(G, 'codeunit 12 "gen. jnl.-post line"')
-    assert matches.top_tier_count == 1
+    assert not find_node_ambiguity(G, 'codeunit 12 "gen. jnl.-post line"')
     assert G.nodes[matches[0]]["label"] == 'Codeunit 12 "Gen. Jnl.-Post Line"'
 
 
@@ -73,23 +73,25 @@ def test_same_name_different_type_disambiguated_by_full_reference(tmp_path: Path
     G = build_from_json(result)
 
     table_matches = _find_node(G, 'table 27 "item"')
-    assert table_matches.top_tier_count == 1
+    assert not find_node_ambiguity(G, 'table 27 "item"')
     assert G.nodes[table_matches[0]]["label"] == 'Table 27 "Item"'
 
     page_matches = _find_node(G, 'page 30 "item"')
-    assert page_matches.top_tier_count == 1
+    assert not find_node_ambiguity(G, 'page 30 "item"')
     assert G.nodes[page_matches[0]]["label"] == 'Page 30 "Item"'
 
 
 def test_same_name_different_type_ambiguous_by_bare_name(tmp_path: Path) -> None:
     """US2 Acceptance Scenario 2: querying by the shared bare name alone must
-    surface the ambiguity (top_tier_count > 1) rather than silently
-    returning one arbitrarily-chosen candidate. Both objects now tie in the
-    SUBSTRING tier (not exact) -- their full labels ("Table 27 \"Item\"",
-    "Page 30 \"Item\"") no longer equal the bare query "item" now that
-    labels carry type/ID tokens too (research.md R3) -- the ambiguity
-    check must catch a tie in whichever tier actually wins, not only the
-    exact tier.
+    surface the ambiguity (find_node_ambiguity returning both rivals) rather
+    than silently returning one arbitrarily-chosen candidate. Both objects
+    now tie in the SUBSTRING tier (not exact) -- their full labels
+    ("Table 27 \"Item\"", "Page 30 \"Item\"") no longer equal the bare query
+    "item" now that labels carry type/ID tokens too (research.md R3) -- the
+    ambiguity check must catch a tie in whichever tier actually wins, not
+    only the exact tier. They also live in different files (ObjA.al/ObjB.al),
+    which is what makes this genuinely ambiguous rather than ordinary
+    same-file precedence.
     """
     tbl = _write(tmp_path, "ObjA.al",
                  'table 27 "Item" { fields { field(1; "No."; Code[20]) { } } }\n')
@@ -97,11 +99,11 @@ def test_same_name_different_type_ambiguous_by_bare_name(tmp_path: Path) -> None
     result = extract([tbl, pg], cache_root=tmp_path / "cache")
     G = build_from_json(result)
 
-    matches = _find_node(G, "item")
-    assert matches.top_tier_count == 2, (
+    rivals = find_node_ambiguity(G, "item")
+    assert len(rivals) == 2, (
         'both Table 27 "Item" and Page 30 "Item" should tie in the winning tier'
     )
-    labels = {G.nodes[nid]["label"] for nid in matches[:2]}
+    labels = {G.nodes[nid]["label"] for nid in rivals}
     assert labels == {'Table 27 "Item"', 'Page 30 "Item"'}
 
 
@@ -118,4 +120,5 @@ def test_single_top_tier_match_is_not_ambiguous(tmp_path: Path) -> None:
     # (".DoSomething()") doesn't overlap this query at all, so it's not
     # even a candidate, let alone a tie.
     matches = _find_node(G, 'codeunit 12 "gen. jnl.-post line"')
-    assert matches.top_tier_count == 1
+    assert len(matches) == 1
+    assert not find_node_ambiguity(G, 'codeunit 12 "gen. jnl.-post line"')

@@ -1,16 +1,30 @@
-This project is a fork of Graphify (https://github.com/safishamsi/graphify),
-Copyright (c) 2026 Safi Shamsi, distributed under the MIT License (see LICENSE).
+Graphify
+Copyright 2026 Safi Shamsi and the Graphify contributors.
 
-Modifications in this fork add support for the AL programming language
-(Microsoft Dynamics 365 Business Central):
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 
-  - graphify/detect.py        — `.al` registered as a code extension
-  - graphify/extract.py       — _AL_CONFIG, extract_al, _al_collect_facts,
-                                _resolve_al_facts (AL semantic layer)
-  - AL_SUPPORT.md, examples/  — fork documentation and a sample
+Portions of this software were contributed under the MIT License prior to the
+relicensing and remain available under those terms. The original MIT license
+text is retained in LICENSE-MIT.
 
-AL modifications Copyright (c) 2026 the fork authors, released under the same
-MIT License as the upstream project.
+--
+
+This fork (https://github.com/ChristianHovenbitzer/graphify-al) adds support
+for the AL programming language (Microsoft Dynamics 365 Business Central):
+
+  - graphify/detect.py  — `.al` registered as a code extension
+  - graphify/extract.py — _AL_CONFIG, extract_al, _al_collect_facts,
+                          _resolve_al_facts (AL semantic layer)
+  - graphify/serve.py   — _RoutedGraph, _find_node_by_global_id and the
+                          country/version/global_id routing built on top of
+                          it (bc-code-atlas multi-tenant serving)
+  - AL_SUPPORT.md, examples/ — fork documentation and a sample
+
+AL modifications Copyright (c) 2026 the fork authors. Contributed under the
+MIT License prior to the relicensing above (see LICENSE-MIT); AL
+modifications made from that point on follow the upstream project and are
+licensed under the Apache License, Version 2.0, consistent with the rest of
+this package.
 
 AL parsing uses tree-sitter-al (https://github.com/SShadowS/tree-sitter-al),
 an independent MIT-licensed grammar, consumed as a normal Python dependency

@@ -38,6 +38,9 @@ scripts/benchmark_kimi*.json
 scripts/benchmark_kimi*.py
 paper/
 
+# macOS Finder metadata
+.DS_Store
+
 # --- AL fork: never publish any analyzed codebase or its generated graph ---
 # Analyzed repos + their trees live OUTSIDE this repo (default: ../graphify-trees).
 # These rules are belt-and-suspenders in case anything is created inside the repo.

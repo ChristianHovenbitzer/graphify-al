@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "main"]
+    branches: ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "main", "al-support"]
   pull_request:
-    branches: ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "main"]
+    branches: ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "main", "al-support"]
   workflow_dispatch:
 
 jobs:
@@ -50,7 +50,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.12"]
+        python-version: ["3.12"]
 
     steps:
       - uses: actions/checkout@v6
@@ -79,9 +79,9 @@ jobs:
           uv run --frozen graphify install
 
   security-scan:
-    # The dev deps already include bandit, pip-audit, and safety. Run them in
-    # CI so a new HIGH-severity finding or vulnerable dependency is caught on
-    # the PR that introduces it, rather than at the next manual audit.
+    # The dev deps include bandit and pip-audit. Run them in CI so a new
+    # HIGH-severity finding or vulnerable dependency is caught on the PR that
+    # introduces it, rather than at the next manual audit.
     # Non-blocking for now (continue-on-error) to avoid breaking CI on
     # pre-existing findings; remove continue-on-error after the initial
     # cleanup pass.
