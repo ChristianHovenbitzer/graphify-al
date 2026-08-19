@@ -142,7 +142,7 @@ Every system ran on the same harness with the same model and budgets, scored by 
 
 | Requirement | Minimum | Check | Install |
 |---|---|---|---|
-| Python | 3.10+ | `python --version` | [python.org](https://www.python.org/downloads/) |
+| Python | 3.12+ | `python --version` | [python.org](https://www.python.org/downloads/) |
 | uv *(recommended)* | any | `uv --version` | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 | pipx *(alternative)* | any | `pipx --version` | `pip install pipx` |
 
@@ -858,7 +858,7 @@ uv run pytest tests/ -q -k "python"    # filter by name
 ### CI parity checks
 
 The authoritative CI commands live in [`.github/workflows/`](.github/workflows/).
-For local CI-style verification, use Python 3.10 or 3.12 and run:
+For local CI-style verification, use Python 3.12 and run:
 
 ```bash
 uv sync --all-extras --frozen
@@ -886,7 +886,7 @@ is added to CI later. The Bandit and pip-audit CI steps currently use
 > policy before relying on long-path tests. Restart affected shells or applications
 > after changing either setting. For exact parity with the blocking GitHub Actions
 > test matrix, run the suite in WSL or Linux; CI currently runs on Ubuntu with
-> Python 3.10 and 3.12. Pyright is available as a local advisory check, but it is
+> Python 3.12. Pyright is available as a local advisory check, but it is
 > not currently a blocking CI job.
 
 ### Git workflow
