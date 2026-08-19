@@ -18,7 +18,6 @@ from graphify.serve import (
     _bfs,
     _dfs,
     _all_neighbors,
-    _hop_distances,
     _rank_scores,
     _find_node,
     _trigrams,
@@ -604,12 +603,12 @@ def _make_digraph() -> nx.DiGraph:
 
 def test_all_neighbors_follows_incoming_edges_on_digraph():
     G = _make_digraph()
-    assert _all_neighbors(G, "customer") == {"gen_jnl_post_line"}
+    assert set(_all_neighbors(G, "customer")) == {"gen_jnl_post_line"}
 
 
 def test_all_neighbors_matches_plain_neighbors_on_undirected_graph():
     G = _make_graph()
-    assert _all_neighbors(G, "n1") == set(G.neighbors("n1"))
+    assert list(_all_neighbors(G, "n1")) == list(G.neighbors("n1"))
 
 
 def test_bfs_from_concept_reaches_consumer_via_incoming_edge():
@@ -637,43 +636,31 @@ def test_subgraph_to_text_renders_real_edge_direction_not_traversal_order():
     assert "EDGE Customer --references" not in text
 
 
-# --- _hop_distances ---
-
-def test_hop_distances_seed_is_zero():
-    dist = _hop_distances(["n1"], [("n1", "n2"), ("n2", "n3")])
-    assert dist["n1"] == 0
-    assert dist["n2"] == 1
-    assert dist["n3"] == 2
-
-def test_hop_distances_multiple_seeds():
-    dist = _hop_distances(["a", "b"], [("a", "x"), ("b", "y")])
-    assert dist == {"a": 0, "b": 0, "x": 1, "y": 1}
-
-
 # --- _subgraph_to_text ranking (distances/scores) ---
 
 def test_subgraph_to_text_ranks_closer_node_over_higher_degree_node():
     G = _make_graph()
     # n3 has higher degree (2 edges: n2-n3, n3-n4) than n4 (1 edge), so the
     # old degree-only sort would put n3 first regardless of distance from
-    # seed n1. With distances supplied, the closer node (n2, 1 hop) must
-    # still win over a farther, higher-degree node.
+    # seed n1. Hop distance from seeds is now computed internally (BFS over
+    # both edge directions), so the closer node (n2, 1 hop) must still win
+    # over a farther, higher-degree node just by passing seeds.
     text = _subgraph_to_text(
         G, {"n1", "n2", "n3"}, [("n1", "n2"), ("n2", "n3")],
-        seeds=["n1"], distances={"n1": 0, "n2": 1, "n3": 2},
+        seeds=["n1"],
     )
     n2_pos = text.index("NODE cluster")
     n3_pos = text.index("NODE build")
     assert n2_pos < n3_pos
 
-def test_subgraph_to_text_without_distances_falls_back_to_degree_order():
-    # No distances/scores passed -> must be byte-identical to the pre-fix
-    # degree-only behavior other callers may still rely on.
+def test_subgraph_to_text_without_seeds_falls_back_to_degree_order():
+    # No seeds/scores passed -> every node ties on hop distance (unreached)
+    # and on score, so the sort degrades to the previous degree-only order.
     G = _make_graph()
     text = _subgraph_to_text(G, {"n1", "n2", "n3", "n4"}, [("n1", "n2"), ("n2", "n3"), ("n3", "n4")])
     text_explicit_none = _subgraph_to_text(
         G, {"n1", "n2", "n3", "n4"}, [("n1", "n2"), ("n2", "n3"), ("n3", "n4")],
-        distances=None, scores=None,
+        scores=None,
     )
     assert text == text_explicit_none
 

@@ -167,7 +167,7 @@ def test_tools_list_over_http(tmp_path):
         )
         assert resp.status_code == 200
         names = {t["name"] for t in resp.json()["result"]["tools"]}
-        assert {"query_graph", "get_node", "graph_stats"} <= names
+        assert {"bcatlas_query_graph", "bcatlas_get_node", "bcatlas_graph_stats"} <= names
 
 
 def _project_with_graph(tmp_path, node_count: int, name: str = "proj") -> str:
@@ -221,10 +221,10 @@ def test_project_path_routes_to_that_projects_graph(tmp_path):
     app = serve_mod._build_http_app(_graph_file(tmp_path), json_response=True)
     with _client(app) as client:
         headers = _init_session(client)
-        assert "Nodes: 2" in _call_tool(client, headers, "graph_stats", {}, rid=2)
-        assert "Nodes: 3" in _call_tool(client, headers, "graph_stats", {"project_path": proj}, rid=3)
+        assert "Nodes: 2" in _call_tool(client, headers, "bcatlas_graph_stats", {}, rid=2)
+        assert "Nodes: 3" in _call_tool(client, headers, "bcatlas_graph_stats", {"project_path": proj}, rid=3)
         # Falling back to the default afterwards still works (no state leak).
-        assert "Nodes: 2" in _call_tool(client, headers, "graph_stats", {}, rid=4)
+        assert "Nodes: 2" in _call_tool(client, headers, "bcatlas_graph_stats", {}, rid=4)
 
 
 @pytest.mark.parametrize(
@@ -259,15 +259,15 @@ def test_project_context_cache_is_lru_and_pins_default_graph(tmp_path, monkeypat
     app = serve_mod._build_http_app(default_graph, json_response=True)
     with _client(app) as client:
         headers = _init_session(client)
-        assert "Nodes: 3" in _call_tool(client, headers, "graph_stats", {"project_path": projects[0]}, rid=2)
-        assert "Nodes: 4" in _call_tool(client, headers, "graph_stats", {"project_path": projects[1]}, rid=3)
+        assert "Nodes: 3" in _call_tool(client, headers, "bcatlas_graph_stats", {"project_path": projects[0]}, rid=2)
+        assert "Nodes: 4" in _call_tool(client, headers, "bcatlas_graph_stats", {"project_path": projects[1]}, rid=3)
         # A cache hit promotes project-0 above project-1 in LRU recency.
-        assert "Nodes: 3" in _call_tool(client, headers, "graph_stats", {"project_path": projects[0]}, rid=4)
-        assert "Nodes: 5" in _call_tool(client, headers, "graph_stats", {"project_path": projects[2]}, rid=5)
+        assert "Nodes: 3" in _call_tool(client, headers, "bcatlas_graph_stats", {"project_path": projects[0]}, rid=4)
+        assert "Nodes: 5" in _call_tool(client, headers, "bcatlas_graph_stats", {"project_path": projects[2]}, rid=5)
         # project-1, not the re-touched project-0, was evicted.
-        assert "Nodes: 4" in _call_tool(client, headers, "graph_stats", {"project_path": projects[1]}, rid=6)
+        assert "Nodes: 4" in _call_tool(client, headers, "bcatlas_graph_stats", {"project_path": projects[1]}, rid=6)
         # The configured default graph stays warm even when project capacity is full.
-        assert "Nodes: 2" in _call_tool(client, headers, "graph_stats", {}, rid=7)
+        assert "Nodes: 2" in _call_tool(client, headers, "bcatlas_graph_stats", {}, rid=7)
 
     first_graph = str((Path(projects[0]) / "graphify-out" / "graph.json").resolve())
     second_graph = str((Path(projects[1]) / "graphify-out" / "graph.json").resolve())
@@ -283,10 +283,10 @@ def test_bad_project_path_errors_without_killing_server(tmp_path):
     app = serve_mod._build_http_app(_graph_file(tmp_path), json_response=True)
     with _client(app) as client:
         headers = _init_session(client)
-        bad = _call_tool(client, headers, "graph_stats",
+        bad = _call_tool(client, headers, "bcatlas_graph_stats",
                          {"project_path": str(tmp_path / "does-not-exist")}, rid=2)
         assert "not found" in bad.lower()
-        assert "Nodes: 2" in _call_tool(client, headers, "graph_stats", {}, rid=3)
+        assert "Nodes: 2" in _call_tool(client, headers, "bcatlas_graph_stats", {}, rid=3)
 
 
 def test_corrupt_project_graph_is_a_tool_error_without_killing_server(tmp_path):
@@ -296,9 +296,9 @@ def test_corrupt_project_graph_is_a_tool_error_without_killing_server(tmp_path):
     app = serve_mod._build_http_app(_graph_file(tmp_path), json_response=True)
     with _client(app) as client:
         headers = _init_session(client)
-        bad = _call_tool(client, headers, "graph_stats", {"project_path": str(project)}, rid=2)
+        bad = _call_tool(client, headers, "bcatlas_graph_stats", {"project_path": str(project)}, rid=2)
         assert "could not load graph.json" in bad
-        assert "Nodes: 2" in _call_tool(client, headers, "graph_stats", {}, rid=3)
+        assert "Nodes: 2" in _call_tool(client, headers, "bcatlas_graph_stats", {}, rid=3)
 
 
 def test_stateless_mode_initialize(tmp_path):

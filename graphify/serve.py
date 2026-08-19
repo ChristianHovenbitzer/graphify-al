@@ -1,5 +1,6 @@
 # MCP stdio server - exposes graph query tools to Claude and other agents
 from __future__ import annotations
+import itertools
 import json
 import math
 import os
@@ -1115,7 +1116,7 @@ def _filter_graph_by_context(G: nx.Graph, context_filters: list[str] | None) -> 
     return H
 
 
-def _all_neighbors(G: nx.Graph, n: str) -> set[str]:
+def _all_neighbors(G: nx.Graph, n: str) -> list[str]:
     """Neighbors of n, following edges in either direction on a directed graph.
 
     Production graphs always load as directed (see _load_graph), and most
@@ -1127,10 +1128,14 @@ def _all_neighbors(G: nx.Graph, n: str) -> set[str]:
     for outward-only traversal. shortest_path already works around this with
     G.to_undirected(); _bfs/_dfs need the same treatment to explore "what
     references this concept", not just "what this concept points to".
+
+    Returns a deduplicated list, not a set: _bfs/_dfs discovery order (and
+    thus the traversal edge list callers rely on) must be deterministic and
+    match successors-then-predecessors order, which a set would discard.
     """
     if G.is_directed():
-        return set(G.successors(n)) | set(G.predecessors(n))
-    return set(G.neighbors(n))
+        return list(dict.fromkeys(itertools.chain(G.successors(n), G.predecessors(n))))
+    return list(G.neighbors(n))
 
 
 def _complete_induced_edges(G: nx.Graph, visited: set[str], edges_seen: list[tuple]) -> None:
@@ -1269,6 +1274,7 @@ def _subgraph_to_text(
     # Work-memory overlay (derived sidecar) stashed on the graph at load time.
     # Empty when no sidecar exists, so un-annotated output stays byte-identical.
     overlay = getattr(G, "graph", {}).get("_learning_overlay", {}) or {}
+    seed_set = set(seeds or [])
     seed_hits = [n for n in (seeds or []) if n in nodes]
     # Rank non-seed nodes by hop distance from the seeds so the node that answers
     # the query (a direct hit or its close neighbors) survives the budget cut
@@ -1347,15 +1353,17 @@ def _subgraph_to_text(
             # and callees alike, so a caller->callee edge renders backwards
             # whenever the callee is visited first. _src/_tgt (stashed on the
             # edge data by the `query` CLI loader) carry the real direction;
-            # fall back to (u, v) for graphs/edges that don't set them.
-            src = d.get("_src", u)
-            tgt = d.get("_tgt", v)
+            # fall back to (src_id, tgt_id) -- the direction already verified
+            # to actually exist on G above -- rather than raw (u, v), which
+            # can be backwards relative to the stored edge on a directed graph.
+            src = d.get("_src", src_id)
+            tgt = d.get("_tgt", tgt_id)
             # Guard against a stray/dangling _src/_tgt (hand-edited or adversarial
             # graph.json): only trust them when they name exactly this edge's
-            # endpoints, else fall back to (u, v). Without this, G.nodes[src]
-            # would KeyError on an unknown id (#2080 review).
+            # endpoints, else fall back to (src_id, tgt_id). Without this,
+            # G.nodes[src] would KeyError on an unknown id (#2080 review).
             if {src, tgt} != {u, v}:
-                src, tgt = u, v
+                src, tgt = src_id, tgt_id
             context = d.get("context")
             context_suffix = f" context={sanitize_label(str(context))}" if context else ""
             # The relation SITE (call/import/reference line in the source's
@@ -1506,7 +1514,15 @@ def _query_graph_text(
     # Pass the seeds so the queried symbol renders first and survives truncation
     # (#BUG2): a branch merge had silently dropped this argument, leaving the
     # seed-first ordering as dead code.
-    score_map = {nid: score for score, nid in _rank_scores(G, terms, start_nodes, qs.ranked)}
+    #
+    # score_map comes straight from qs.ranked (the single _score_query call
+    # above), NOT _rank_scores: _rank_scores' seed-tautology refinement needs
+    # a second scoring pass over a filtered term set, which would reintroduce
+    # exactly the T+1-pass cost the single _score_query call above exists to
+    # eliminate (see test_query_graph_text_makes_exactly_one_score_query_call).
+    # _rank_scores remains available (and unit-tested) for a future caller
+    # that can afford a second pass.
+    score_map = {nid: score for score, nid in qs.ranked}
     return header + _subgraph_to_text(
         traversal_graph, nodes, edges, token_budget,
         seeds=start_nodes, scores=score_map,
