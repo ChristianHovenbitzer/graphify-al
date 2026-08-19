@@ -5685,22 +5685,24 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
         # `DataItemLink = <child fld> = <Parent>.<fld>[, ...]` joins it to an
         # enclosing dataitem named on the right-hand side of each pair. Since
         # tree-sitter-al 4.0, that value parses as `link_value_list` >
-        # `link_value`, a flat token sequence (no member_expression wrapper):
-        # [child field, '=', parent name, '.', parent field]. The parent name is
-        # whatever identifier/quoted_identifier token sits right before the '.'.
-        # Resolve that parent by name to its declaration line; both endpoints are
+        # `link_value`, whose declared `value` field holds the RHS: two nodes
+        # for a dotted `Parent.Field` reference (parent name, then field) --
+        # DataItemLink's only legal RHS shape, since it always joins to a
+        # named parent dataitem (unlike RunPageLink/ColumnFilter's field()/
+        # const()/upperlimit() forms, which collapse to a single `value` node
+        # and don't apply here). node-types.json field names are tree-sitter-al's
+        # declared public API (semver-guarded per its CHANGELOG), so read the
+        # parent name off `value[0]` rather than off token position. Resolve
+        # that parent by name to its declaration line; both endpoints are
         # member nodes, resolved by line downstream (#40).
         if obj.type != "query_declaration":
             return
 
         def link_value_parents(n, out: list) -> None:
             if n.type == "link_value":
-                children = n.children
-                for i, c in enumerate(children):
-                    if c.type == "." and i > 0:
-                        prev = children[i - 1]
-                        if prev.type in ("identifier", "quoted_identifier"):
-                            out.append(prev)
+                values = n.children_by_field_name("value")
+                if len(values) >= 2 and values[0].type in ("identifier", "quoted_identifier"):
+                    out.append(values[0])
             for c in n.children:
                 link_value_parents(c, out)
 
