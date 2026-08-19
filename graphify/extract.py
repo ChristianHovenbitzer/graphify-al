@@ -5683,18 +5683,26 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
     def collect_query_joins(obj) -> None:
         # query dataitem -> dataitem `DataItemLink` join edges. A nested dataitem's
         # `DataItemLink = <child fld> = <Parent>.<fld>[, ...]` joins it to an
-        # enclosing dataitem named on each comparison's right-hand side (a
-        # member_expression whose `object` is the parent dataitem). Resolve that
-        # parent by name to its declaration line; both endpoints are member nodes,
-        # resolved by line downstream (#40).
+        # enclosing dataitem named on the right-hand side of each pair. Since
+        # tree-sitter-al 4.0, that value parses as `link_value_list` >
+        # `link_value`, a flat token sequence (no member_expression wrapper):
+        # [child field, '=', parent name, '.', parent field]. The parent name is
+        # whatever identifier/quoted_identifier token sits right before the '.'.
+        # Resolve that parent by name to its declaration line; both endpoints are
+        # member nodes, resolved by line downstream (#40).
         if obj.type != "query_declaration":
             return
 
-        def member_exprs(n, out: list) -> None:
-            if n.type == "member_expression":
-                out.append(n)
+        def link_value_parents(n, out: list) -> None:
+            if n.type == "link_value":
+                children = n.children
+                for i, c in enumerate(children):
+                    if c.type == "." and i > 0:
+                        prev = children[i - 1]
+                        if prev.type in ("identifier", "quoted_identifier"):
+                            out.append(prev)
             for c in n.children:
-                member_exprs(c, out)
+                link_value_parents(c, out)
 
         def walk_j(n, ancestors: dict) -> None:
             if n.type == "query_dataitem":
@@ -5709,12 +5717,9 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                         pn = prop.child_by_field_name("name")
                         if pn is None or text(pn).strip().lower() != "dataitemlink":
                             continue
-                        mes: list = []
-                        member_exprs(prop, mes)
-                        for me in mes:
-                            pobj = me.child_by_field_name("object")
-                            if pobj is None:
-                                continue
+                        parents: list = []
+                        link_value_parents(prop, parents)
+                        for pobj in parents:
                             pline = ancestors.get(_al_strip_quotes(text(pobj)).lower())
                             if pline and pline != di_line:
                                 facts.append({"kind": "dataitem_link",
