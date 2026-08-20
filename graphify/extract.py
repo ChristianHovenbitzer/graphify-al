@@ -1157,6 +1157,30 @@ def _al_property_value(prop, source: bytes) -> str:
     return rhs.strip().rstrip(";").strip().strip('"')
 
 
+def _al_field_names_of(obj, source: bytes) -> set[str]:
+    """Names of the fields an AL table/tableextension declares itself.
+
+    Used to resolve a BARE field reference in table code (`Quantity := ...`,
+    implicit Rec) without guessing: a bare identifier becomes a field edge only
+    if it is one of these names. A tableextension sees only the fields it adds,
+    so access to a base-table field from an extension trigger is not resolved
+    here.
+    """
+    names: set[str] = set()
+
+    def walk(n) -> None:
+        if n.type == "field_declaration":
+            nm = _al_member_name(n, source)
+            if nm:
+                names.add(_al_strip_quotes(nm))
+            return
+        for c in n.children:
+            walk(c)
+
+    walk(obj)
+    return names
+
+
 def _al_field_attrs(decl, source: bytes) -> dict[str, str]:
     """Data type, FieldClass and behavior properties of an AL field (#38, #39).
 
@@ -5567,13 +5591,16 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
         "getrecordonce", "changecompany", "locktable", "ascending",
     }
 
-    def walk_field_access(node, proc_line: int, varmap: dict, write_ids=None) -> None:
+    def walk_field_access(node, proc_line: int, varmap: dict, write_ids=None,
+                          self_record: tuple | None = None) -> None:
         """Collect a procedure's field accesses as facts.
 
         Writing in AL is (a) `Rec.Field := X` and (b) `Rec.Validate(Field, X)`.
         `SetRange`/`SetFilter` FILTER, they do not write - they stay out via
         _AL_FIELD_SKIP. Note `assignment_statement` has no `left` field in
-        tree-sitter-al: the first named child is the target.
+        tree-sitter-al: the first named child is the target. Write positions are
+        keyed by start_byte, not id(): a tree-sitter Node fetched again through a
+        different path is a different Python object.
         """
         if write_ids is None:
             write_ids = set()
@@ -5581,8 +5608,24 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
         if node.type == "assignment_statement":
             for c in node.children:
                 if c.is_named:
-                    write_ids.add(id(c))
+                    write_ids.add(c.start_byte)
                     break
+
+        # Bare `Validate(Field, ...)` in table code: implicit Rec, so the first
+        # argument is a WRITE. Without this it arrives at the bare-name branch
+        # below as a read, inverting the direction of the one edge that answers
+        # "what does validating this field change".
+        if node.type == "call_expression" and self_record is not None:
+            fn0 = node.child_by_field_name("function")
+            if (fn0 is not None and fn0.type == "identifier"
+                    and text(fn0).lower() == "validate"):
+                args0 = node.child_by_field_name("arguments") or next(
+                    (c for c in node.children if c.type == "argument_list"), None)
+                if args0 is not None:
+                    first0 = next((a for a in args0.children
+                                   if a.type in ("identifier", "quoted_identifier")), None)
+                    if first0 is not None:
+                        write_ids.add(first0.start_byte)
 
         # `Rec.Validate(Field, ...)` writes Field.
         if node.type == "call_expression":
@@ -5620,11 +5663,32 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                         facts.append({
                             "kind": "accesses_field", "src_line": proc_line,
                             "target": decl[1], "field": fname,
-                            "mode": "write" if id(node) in write_ids else "read",
+                            "mode": "write" if node.start_byte in write_ids else "read",
                         })
 
+        # Bare `Field` inside a table: implicit Rec, and by far the dominant
+        # spelling in table code (`Quantity := Round("Quantity (Base)" / ...)`).
+        # Matched against the field names this object actually declares rather
+        # than by exclusion, so a call target, an enum value or a label can never
+        # become a field edge. `Rec.Amount` is consumed by the branch above and a
+        # member's own name node is skipped here, so nothing is counted twice.
+        if self_record is not None and node.type in ("identifier", "quoted_identifier"):
+            table_name, field_names = self_record
+            parent = node.parent
+            qualified = parent is not None and parent.type == "member_expression"
+            callee = (parent is not None and parent.type == "call_expression"
+                      and parent.child_by_field_name("function") is node)
+            if not qualified and not callee:
+                fname = _al_strip_quotes(text(node))
+                if fname.lower() in field_names:
+                    facts.append({
+                        "kind": "accesses_field", "src_line": proc_line,
+                        "target": table_name, "field": fname,
+                        "mode": "write" if node.start_byte in write_ids else "read",
+                    })
+
         for c in node.children:
-            walk_field_access(c, proc_line, varmap, write_ids)
+            walk_field_access(c, proc_line, varmap, write_ids, self_record)
 
     def walk_calls(node, proc_line: int, varmap: dict, usercontrols: dict) -> None:
         if node.type == "call_expression":
@@ -6203,6 +6267,23 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
         for c in body.children:
             if c.type == "var_section":
                 collect_vars(c, obj_vars)
+
+        # Inside a table (or tableextension) the object's own record is in scope
+        # under three spellings and one omission: `Rec.Field`, `xRec.Field`,
+        # `this.Field` (on a table `this` IS Rec) and the bare `Field`, which is by
+        # far the most common form in table code. The three aliases resolve through
+        # the ordinary record-variable path; `self_record` carries the table name
+        # plus its declared field names for the bare form.
+        self_record: tuple | None = None
+        if obj.type in ("table_declaration", "tableextension_declaration"):
+            self_table = (_al_strip_quotes(text(base))
+                          if obj.type == "tableextension_declaration" and base is not None
+                          else _al_strip_quotes(_al_member_name(obj, source) or ""))
+            own_fields = {f.lower() for f in _al_field_names_of(obj, source)}
+            if self_table and own_fields:
+                self_record = (self_table, own_fields)
+                for alias in ("rec", "xrec", "this"):
+                    obj_vars.setdefault(alias, ("record", self_table))
         uses: set = {v for v in obj_vars.values() if v[0] in _AL_USES_CLASSES}
 
         # Page `usercontrol(<ctrl>; <AddIn>)`: a page->add-in usage edge, plus a
@@ -6255,7 +6336,7 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                 pbody = c.child_by_field_name("body")
                 if pbody is not None:
                     walk_calls(pbody, proc_line, vm, usercontrols)
-                    walk_field_access(pbody, proc_line, vm)
+                    walk_field_access(pbody, proc_line, vm, None, self_record)
             pending = []
 
         # NESTED triggers. The loop above only sees direct children of the object
@@ -6278,7 +6359,7 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                 tbody = n.child_by_field_name("body")
                 if tbody is not None:
                     walk_calls(tbody, tline, vm2, usercontrols)
-                    walk_field_access(tbody, tline, vm2)
+                    walk_field_access(tbody, tline, vm2, None, self_record)
                 return
             if n.type == "var_section":
                 vars_here = dict(scope_vars)
