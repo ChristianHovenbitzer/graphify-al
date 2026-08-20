@@ -58,10 +58,16 @@ def test_mutates_delete_deleteall_insert(tmp_path):
 
     result = extract([hdr, line, pay, cu], cache_root=tmp_path)
 
-    hdr_id = next(n["id"] for n in result["nodes"] if n["label"] == '"Sales Header"')
-    line_id = next(n["id"] for n in result["nodes"] if n["label"] == '"Sales Line"')
-    pay_id = next(n["id"] for n in result["nodes"]
-                  if n["label"] == '"Payment Line"')
+    # Object labels carry an `<Type> <Id> ` prefix ("Table 50100 \"Sales Header\""),
+    # so match on the quoted name only -- the prefix is not what is under test.
+    def _table_id(name: str) -> str:
+        return next(n["id"] for n in result["nodes"]
+                    if n.get("al_object_type") == "table"
+                    and n["label"].endswith(name))
+
+    hdr_id = _table_id('"Sales Header"')
+    line_id = _table_id('"Sales Line"')
+    pay_id = _table_id('"Payment Line"')
     proc_id = next(n["id"] for n in result["nodes"] if n["label"] == ".Scrap()")
 
     by_target = {e["target"]: e for e in _mutates(result)}
@@ -184,7 +190,7 @@ def test_mutates_prefers_table_over_same_named_codeunit(tmp_path):
 
     tbl_id = next(n["id"] for n in result["nodes"]
                   if n.get("al_object_type") == "table"
-                  and n["label"] == '"Payment Line"')
+                  and n["label"].endswith('"Payment Line"'))
     edges = _mutates(result)
     assert len(edges) == 1
     assert edges[0]["target"] == tbl_id

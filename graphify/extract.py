@@ -1122,14 +1122,51 @@ def _al_member_name(decl, source: bytes) -> str | None:
     return None
 
 
+# Field properties that change runtime behavior and are NOT recoverable from an
+# edge (#39). `TableRelation` and `CalcFormula` are deliberately absent: they are
+# already modeled as `relates_to` / `computes_from` edges, and duplicating them as
+# text would give two sources of truth. Presentation and localization properties
+# (Caption*, ToolTip*, AutoFormat*, DecimalPlaces, ...) and SQL/storage properties
+# are deliberately excluded as noise.
+_AL_FIELD_PROP_ATTRS = {
+    # defaulting the program does on its own
+    "autoincrement": "al_auto_increment",
+    "initvalue": "al_init_value",
+    # whether a TableRelation is actually enforced on Validate()
+    "validatetablerelation": "al_validate_table_relation",
+    "testtablerelation": "al_test_table_relation",
+    # do not recommend a field that is on its way out
+    "obsoletestate": "al_obsolete_state",
+    "obsoletetag": "al_obsolete_tag",
+    # reachability from another extension / by user input
+    "access": "al_access",
+    "editable": "al_editable",
+}
+
+
+def _al_property_value(prop, source: bytes) -> str:
+    """Raw right-hand side of an AL `property` node.
+
+    Read as text rather than by child type on purpose: property values are
+    identifiers (`FlowField`), booleans (`true`), numbers (`InitValue = 1`) and
+    enum-ish tokens (`ObsoleteState = Pending`), and picking the first
+    identifier child silently drops the non-identifier ones.
+    """
+    raw = _read_text(prop, source)
+    _, _, rhs = raw.partition("=")
+    return rhs.strip().rstrip(";").strip().strip('"')
+
+
 def _al_field_attrs(decl, source: bytes) -> dict[str, str]:
-    """Data type + FieldClass of an AL table/tableextension field (#38).
+    """Data type, FieldClass and behavior properties of an AL field (#38, #39).
 
     ``type`` is the raw ``type_specification`` text (``Code[20]``, ``Decimal``,
     ``Enum "X"``, ...). ``field_class`` is the value of the ``FieldClass``
     property in the field's ``declaration_body`` (``FlowField`` / ``FlowFilter``);
     AL defaults an omitted FieldClass to ``Normal``, so that is what we store when
-    the property is absent. Returns only the keys that apply so non-field members
+    the property is absent. Properties in ``_AL_FIELD_PROP_ATTRS`` are added only
+    when present, so an absent property stays absent instead of asserting a
+    default we did not read. Returns only the keys that apply so non-field members
     are left untouched.
     """
     attrs: dict[str, str] = {}
@@ -1153,8 +1190,15 @@ def _al_field_attrs(decl, source: bytes) -> dict[str, str]:
                     name = _read_text(ch, source).strip()
                 elif ch.type in ("identifier", "quoted_identifier") and val is None:
                     val = _read_text(ch, source).strip()
-            if name and name.lower() == "fieldclass" and val:
+            if not name:
+                continue
+            low = name.lower()
+            if low == "fieldclass" and val:
                 field_class = val
+            elif low in _AL_FIELD_PROP_ATTRS:
+                pval = _al_property_value(p, source)
+                if pval:
+                    attrs[_AL_FIELD_PROP_ATTRS[low]] = pval
     attrs["field_class"] = field_class
     return attrs
 
@@ -5508,6 +5552,80 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
             return None  # first real arg is not an object -> can't resolve statically
         return None
 
+    # Field access of a procedure: `Cust."No."` / `Rec.Amount` -> edge from the
+    # procedure to the field node of the declared table. Record-typed variables only
+    # (incl. Rec/xRec via obj_vars), so codeunit/page members add no noise. The skip
+    # list is the Record METHOD surface: `Rec.SetRange(...)` is a member_expression
+    # too, and without it every record method would look like a field.
+    _AL_FIELD_SKIP = {
+        "get", "find", "findset", "findfirst", "findlast", "next", "insert", "modify",
+        "delete", "deleteall", "modifyall", "init", "reset", "setrange", "setfilter",
+        "setcurrentkey", "setascending", "setloadfields", "calcfields", "calcsums",
+        "testfield", "validate", "isempty", "count", "copy", "readisolation",
+        "setrecfilter", "getfilter", "getfilters", "sethidevalidationdialog",
+        "fieldno", "recordid", "systemid", "transferfields", "setautocalcfields",
+        "getrecordonce", "changecompany", "locktable", "ascending",
+    }
+
+    def walk_field_access(node, proc_line: int, varmap: dict, write_ids=None) -> None:
+        """Collect a procedure's field accesses as facts.
+
+        Writing in AL is (a) `Rec.Field := X` and (b) `Rec.Validate(Field, X)`.
+        `SetRange`/`SetFilter` FILTER, they do not write - they stay out via
+        _AL_FIELD_SKIP. Note `assignment_statement` has no `left` field in
+        tree-sitter-al: the first named child is the target.
+        """
+        if write_ids is None:
+            write_ids = set()
+
+        if node.type == "assignment_statement":
+            for c in node.children:
+                if c.is_named:
+                    write_ids.add(id(c))
+                    break
+
+        # `Rec.Validate(Field, ...)` writes Field.
+        if node.type == "call_expression":
+            fn = node.child_by_field_name("function")
+            if fn is not None and fn.type == "member_expression":
+                ob = fn.child_by_field_name("object")
+                mem = fn.child_by_field_name("member")
+                if (ob is not None and mem is not None and ob.type == "identifier"
+                        and text(mem).lower() == "validate"):
+                    decl = varmap.get(text(ob).lower())
+                    if decl and decl[0] == "record":
+                        args = node.child_by_field_name("arguments")
+                        if args is None:
+                            args = next((c for c in node.children
+                                         if c.type == "argument_list"), None)
+                        if args is not None:
+                            first = next((a for a in args.children
+                                          if a.type in ("identifier", "quoted_identifier")), None)
+                            if first is not None:
+                                fname = _al_strip_quotes(text(first))
+                                if fname:
+                                    facts.append({
+                                        "kind": "accesses_field", "src_line": proc_line,
+                                        "target": decl[1], "field": fname, "mode": "write",
+                                    })
+
+        if node.type == "member_expression":
+            ob = node.child_by_field_name("object")
+            mem = node.child_by_field_name("member")
+            if ob is not None and mem is not None and ob.type == "identifier":
+                decl = varmap.get(text(ob).lower())
+                if decl and decl[0] == "record":
+                    fname = _al_strip_quotes(text(mem))
+                    if fname and fname.lower() not in _AL_FIELD_SKIP:
+                        facts.append({
+                            "kind": "accesses_field", "src_line": proc_line,
+                            "target": decl[1], "field": fname,
+                            "mode": "write" if id(node) in write_ids else "read",
+                        })
+
+        for c in node.children:
+            walk_field_access(c, proc_line, varmap, write_ids)
+
     def walk_calls(node, proc_line: int, varmap: dict, usercontrols: dict) -> None:
         if node.type == "call_expression":
             fn = node.child_by_field_name("function")
@@ -6132,6 +6250,7 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                 pbody = c.child_by_field_name("body")
                 if pbody is not None:
                     walk_calls(pbody, proc_line, vm, usercontrols)
+                    walk_field_access(pbody, proc_line, vm)
             pending = []
 
         if _AL_EMIT_USES:
@@ -6540,11 +6659,15 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
     # codeunit and a table under the same name. `obj_by_name` keeps whichever file
     # was seen first, so a `Record "X"` reference can land on the same-named
     # codeunit. A record type is a table by construction - resolve it type-first.
+    # Keyed exactly like `obj_by_name` above: `label` is the full type+ID+name
+    # canonical reference, so the bare name comes from `al_object_name` and only
+    # external stubs fall back to stripping the label.
     table_by_name: dict[str, str] = {}
     for n in objnodes:
         if str(n.get("al_object_type", "")).lower() == "table":
-            table_by_name.setdefault(_al_strip_quotes(n.get("label", "")).lower(),
-                                     n["id"])
+            key = (n.get("al_object_name")
+                   or _al_strip_quotes(n.get("label", ""))).lower()
+            table_by_name.setdefault(key, n["id"])
 
     objids = sorted((n["id"] for n in objnodes), key=len, reverse=True)
     proc_by_objmeth: dict[tuple, str] = {}
