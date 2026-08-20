@@ -6227,6 +6227,10 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                     collect_usercontrols(c)
             collect_usercontrols(body)
 
+        # Bodies already walked, so the nested pass below cannot walk an
+        # object-level trigger a second time and double every edge out of it.
+        seen_body_lines: set[int] = set()
+
         pending: list[str] = []
         for c in body.children:
             if c.type == "attribute_item":
@@ -6234,6 +6238,7 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                 continue
             if c.type in ("procedure", "trigger_declaration", "interface_procedure"):
                 proc_line = line(c)
+                seen_body_lines.add(proc_line)
                 for a in pending:
                     ev = _al_parse_event_subscriber(a)
                     if ev:
@@ -6252,6 +6257,36 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                     walk_calls(pbody, proc_line, vm, usercontrols)
                     walk_field_access(pbody, proc_line, vm)
             pending = []
+
+        # NESTED triggers. The loop above only sees direct children of the object
+        # body, i.e. object-wide triggers (OnRun, OnInsert, OnOpenPage). `OnValidate`
+        # sits in fields{field{trigger}} and `OnAction` in
+        # actions{area{action{trigger}}} - neither was walked, so field validations
+        # and actions carried no call and no field-access edges at all, even though
+        # that is where the business logic lives.
+        def walk_nested_triggers(n, scope_vars: dict) -> None:
+            vars_here = scope_vars
+            if n.type in ("procedure", "trigger_declaration", "interface_procedure"):
+                tline = line(n)
+                if tline in seen_body_lines:
+                    return
+                seen_body_lines.add(tline)
+                vm2 = dict(scope_vars)
+                for pc in n.children:
+                    if pc.type in ("parameter_list", "var_section"):
+                        collect_vars(pc, vm2)
+                tbody = n.child_by_field_name("body")
+                if tbody is not None:
+                    walk_calls(tbody, tline, vm2, usercontrols)
+                    walk_field_access(tbody, tline, vm2)
+                return
+            if n.type == "var_section":
+                vars_here = dict(scope_vars)
+                collect_vars(n, vars_here)
+            for ch in n.children:
+                walk_nested_triggers(ch, vars_here)
+
+        walk_nested_triggers(body, dict(obj_vars))
 
         if _AL_EMIT_USES:
             for _cls, name in uses:
